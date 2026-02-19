@@ -1,0 +1,73 @@
+############################################
+# Python / Virtual Environments
+############################################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtualenv / Conda
+venv/
+.venv/
+env/
+.env/
+.conda/
+.python-version
+
+############################################
+# IDE / Editor
+############################################
+.vscode/
+.idea/
+*..code-workspace
+.DS_Store
+*.swp
+*.swo
+
+############################################
+# Logs / Temp
+############################################
+logs/
+*.log
+*.tmp
+*.temp
+*.pid
+
+############################################
+# MLflow / Artifacts / Checkpoints
+############################################
+mlruns/
+artifacts/
+models/
+checkpoints/
+
+############################################
+# Data - CSV files are TRACKED (committed)
+############################################
+data/
+!data/README.md
+!data/**/*.csv
+!*.csv
+
+############################################
+# Jupyter / Notebooks
+# NOTE: *.ipynb notebooks and notebooks/ folder are TRACKED (committed)
+# Only checkpoint files are ignored
+############################################
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+############################################
+# HuggingFace / Cache
+############################################
+~/.cache/
+hf_cache/
+**/.cache/
+
+############################################
+# Cursor / Editor-specific project files
+############################################
+.cursor/
+.VSCodeCounter/
+

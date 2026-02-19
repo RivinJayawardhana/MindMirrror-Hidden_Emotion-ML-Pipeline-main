@@ -1,0 +1,93 @@
+data_paths:
+  # Default dataset (can be overridden via command-line)
+  raw_data: "merged_full_dataset.csv"
+  processed_data: "data/processed/preprocessed_emotions.csv"
+  artifacts_dir: "artifacts"
+  data_artifacts_dir: "artifacts/data"
+  model_artifacts_dir: "artifacts/models"
+  mlflow_tracking_uri: "file:./mlruns"
+  pretrained_models_dir: "artifacts/pretrained"  # HuggingFace models saved here for reuse
+  
+  # Multiple dataset support (optional - use dataset_name to select)
+  datasets:
+    default: "merged_full_dataset.csv"
+    merged: "merged_full_dataset.csv"
+    balanced: "balanced_emotion_dataset_smart.csv"
+    clean: "balanced_emotion_dataset_smart_clean_text.csv"
+    # Add your custom datasets here:
+    # custom1: "path/to/your/dataset1.csv"
+    # custom2: "path/to/your/dataset2.csv"
+
+attributes:
+  emotion_categories:
+    - 'joy'
+    - 'anger'
+    - 'sadness'
+    - 'fear'
+    - 'love'
+    - 'surprise'
+  required_attributes:
+    - 'text'
+    - 'hidden_emotion_label'
+    - 'primary_emoji'
+    - 'emoji_emotion'
+  text_column: 'text'
+  label_column: 'hidden_emotion_label'
+
+model:
+  base_model_name: "microsoft/deberta-v3-base"  # Can be changed to roberta-base, bert-base-uncased, etc.
+  num_emotions: 6
+  dropout: 0.3
+  freeze_layers: 1  # Reduced from 2 - allow more layers to train
+
+training:
+  num_epochs: 5
+  batch_size: 32
+  val_batch_size: 64
+  learning_rate_encoder: 5e-6  # Further reduced for stability (was causing NaN)
+  learning_rate_head: 1e-5     # Further reduced for stability
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  warmup_steps: 0.1  # Fraction of total steps
+  scheduler_type: "cosine"  # cosine or linear
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 5  # Increased patience
+    monitor: "val_emo_accuracy"  # val_loss, val_emo_accuracy, val_hid_accuracy
+    mode: "max"  # max or min
+  
+  # Class imbalance handling
+  class_weights:
+    method: "effective_num"  # effective_num, inverse_freq, or none
+    beta: 0.999  # Smoothing factor for effective number
+  
+  # Loss function
+  loss:
+    focal_gamma: 1.5
+    hidden_weight: 0.5  # Reduced to balance tasks better
+    label_smoothing: 0.05  # Reduced label smoothing
+    pos_weight: 1.5  # Reduced pos_weight for hidden flag
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    probability: 0.3
+    minority_classes: [3, 4, 5]  # fear, love, surprise indices
+  
+  # Data split
+  train_val_split:
+    test_size: 0.2
+    random_state: 42
+    stratify: true
+
+tokenizer:
+  max_length: 128
+  padding: "max_length"
+  truncation: true
+
+mlflow:
+  experiment_name: "hidden_emotion_detection"
+  tracking_enabled: true
+  log_artifacts: true
