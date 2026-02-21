@@ -1,7 +1,6 @@
 """
 Transformer-based multi-task emotion classification model.
-Matches notebook architecture exactly with fine-tuning support.
-Includes accuracy improvements: better initialization, layer-wise LR decay, gradient checkpointing.
+Enhanced version with attention pooling, residual connections, and temperature scaling.
 """
 import torch
 import torch.nn as nn
@@ -18,13 +17,11 @@ class EnhancedEmotionHiddenModel(nn.Module):
     1. 6-class hidden emotion classification
     2. Binary hidden emotion flag detection
     
-    Architecture matches notebook exactly with accuracy improvements:
+    Architecture includes:
     - Transformer encoder (fine-tunable)
-    - Mean pooling (not just CLS token)
-    - Shared projection layer
-    - Separate heads for each task
-    - Layer-wise learning rate decay support
-    - Gradient checkpointing option
+    - Attention-based mean pooling
+    - Shared projection layer with residual
+    - Separate heads for each task with temperature scaling
     """
     
     def __init__(self, base_model_name: str, num_emotions: int = 6, dropout_p: float = 0.3, 
@@ -56,6 +53,12 @@ class EnhancedEmotionHiddenModel(nn.Module):
         expanded_size = hidden_size * hidden_size_factor
         
         logger.info(f"Loaded encoder: {load_path} (hidden_size={hidden_size})")
+        
+        # Attention-based pooling (learnable weights for tokens)
+        self.attention_pooling = nn.Sequential(
+            nn.Linear(hidden_size, 1),
+            nn.Tanh()
+        )
         
         # Shared projection with residual connection
         self.shared_projection = nn.Sequential(
@@ -96,18 +99,12 @@ class EnhancedEmotionHiddenModel(nn.Module):
         # Temperature scaling for calibration (improves confidence estimates)
         self.temperature = nn.Parameter(torch.ones(1) * 1.5)
         
-        # Attention-based pooling (learnable weights for tokens)
-        self.attention_pooling = nn.Sequential(
-            nn.Linear(hidden_size, 1),
-            nn.Tanh()
-        )
-        
         # Initialize weights with improved methods
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize head weights using orthogonal initialization for better training"""
-        for module in [self.emotion_head, self.hidden_head, self.shared_projection]:
+        """Initialize head weights using orthogonal initialization for better gradient flow"""
+        for module in [self.emotion_head, self.hidden_head, self.shared_projection, self.attention_pooling]:
             for layer in module:
                 if isinstance(layer, nn.Linear):
                     # Orthogonal initialization for better gradient flow

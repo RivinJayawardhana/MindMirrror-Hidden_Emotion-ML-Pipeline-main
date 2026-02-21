@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from utils.config import get_data_paths, get_emotion_categories
 from src.data_ingestion import DataIngestorCSV
+# IMPORT from shared preprocessing
+from src.preprocessing import normalize_emotion_label, extract_primary_emoji
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,42 +25,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def normalize_emotion_label(e):
-    """
-    Normalize emotion labels to standard categories.
-    Matches notebook implementation.
-    """
-    valid_emotions = ["joy", "sadness", "anger", "fear", "love", "surprise"]
-    
-    e = str(e).strip().lower()
-    if e in valid_emotions:
-        return e
-    if e == "happy":
-        return "joy"
-    if e in ["mad", "furious", "rage"]:
-        return "anger"
-    return None
-
-
-def extract_primary_emoji(text: str) -> str:
-    """Extract first emoji from text."""
-    text = str(text)
-    for ch in text:
-        if ch in emoji.EMOJI_DATA:
-            return ch
-    return ""
-
-
 def emotion_data_pipeline(data_path: str = None):
     """
     End-to-end data preprocessing pipeline.
     Matches notebook workflow: Load → Clean → Normalize → Split
     
     Returns:
-        Tuple of (train_data, val_data, label_encoder) where:
-        - train_data: dict with 'texts', 'emo_ids', 'hid_ids', 'emojis'
-        - val_data: dict with 'texts', 'emo_ids', 'hid_ids', 'emojis'
-        - label_encoder: sklearn LabelEncoder
+        Tuple of (train_data, val_data, label_encoder)
     """
     data_paths = get_data_paths()
     emotion_categories = get_emotion_categories()
@@ -87,13 +60,13 @@ def emotion_data_pipeline(data_path: str = None):
     df["text"] = df["text"].astype(str).str.strip()
     df["text"] = df["text"].str.replace(r"\s+", " ", regex=True)
     
-    # Step 3: Normalize emotion labels
+    # Step 3: Normalize emotion labels - USING SHARED FUNCTION
     logger.info("Normalizing emotion labels...")
     df["hidden_emotion_label"] = df["hidden_emotion_label"].apply(normalize_emotion_label)
     df = df[df["hidden_emotion_label"].notna()].reset_index(drop=True)
     logger.info(f"After normalization: {len(df)} samples")
     
-    # Step 4: Extract primary emoji if not present
+    # Step 4: Extract primary emoji if not present - USING SHARED FUNCTION
     if "primary_emoji" not in df.columns or df["primary_emoji"].isna().all():
         logger.info("Extracting primary emoji from text...")
         df["primary_emoji"] = df["text"].apply(extract_primary_emoji)

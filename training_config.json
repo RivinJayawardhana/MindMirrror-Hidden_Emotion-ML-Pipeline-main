@@ -1,0 +1,71 @@
+{
+  "class_names": [
+    "anger",
+    "fear",
+    "joy",
+    "love",
+    "sadness",
+    "surprise"
+  ],
+  "model_config": {
+    "base_model_name": "microsoft/deberta-v3-base",
+    "num_emotions": 6,
+    "dropout": 0.3,
+    "freeze_layers": 1
+  },
+  "training_config": {
+    "num_epochs": 5,
+    "batch_size": 32,
+    "val_batch_size": 64,
+    "learning_rate_encoder": "5e-6",
+    "learning_rate_head": "1e-5",
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "warmup_steps": 0.1,
+    "scheduler_type": "cosine",
+    "early_stopping": {
+      "enabled": true,
+      "patience": 5,
+      "monitor": "val_emo_accuracy",
+      "mode": "max"
+    },
+    "class_weights": {
+      "method": "effective_num",
+      "beta": 0.999
+    },
+    "loss": {
+      "focal_gamma": 1.5,
+      "hidden_weight": 0.5,
+      "label_smoothing": 0.05,
+      "pos_weight": 1.5
+    },
+    "augmentation": {
+      "enabled": true,
+      "probability": 0.3,
+      "minority_classes": [
+        3,
+        4,
+        5
+      ]
+    },
+    "train_val_split": {
+      "test_size": 0.2,
+      "random_state": 42,
+      "stratify": true
+    }
+  },
+  "final_metrics": {
+    "emo_accuracy": 0.5182445759368837,
+    "emo_macro_f1": 0.5296329510611876,
+    "emo_weighted_f1": 0.49188926594526794,
+    "hid_accuracy": 0.611439842209073,
+    "hid_precision": 0.5733137829912024,
+    "hid_recall": 0.791497975708502,
+    "hid_f1": 0.6649659863945578,
+    "hid_auc": 0.6688833307380878,
+    "loss": 1.5606044754385948
+  },
+  "per_class_metrics": {
+    "0": {
+      "accuracy": 0.14722753346080306,
+      "avg_confidence": 
