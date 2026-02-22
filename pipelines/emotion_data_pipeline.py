@@ -1,6 +1,6 @@
 """
-Data preprocessing pipeline matching notebook workflow exactly.
-No embeddings - just preprocessing and train/val/test split.
+Data preprocessing pipeline matching notebook workflow exactly with 3-task support.
+Returns: 27-class emotion labels, binary hidden flag, and 6-class hidden emotion labels.
 """
 import os
 import sys
@@ -25,13 +25,69 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def map_to_6_classes(emotion_27: str) -> str:
+    """
+    Map 27-class emotion to 6 basic emotions.
+    Customize this mapping based on your GoEmotions taxonomy.
+    """
+    mapping = {
+        # Joy group
+        'joy': 'joy',
+        'amusement': 'joy',
+        'excitement': 'joy',
+        'happiness': 'joy',
+        'love': 'love',
+        'desire': 'love',
+        'optimism': 'joy',
+        'relief': 'joy',
+        'pride': 'joy',
+        'admiration': 'joy',
+        'gratitude': 'joy',
+        'caring': 'love',
+        
+        # Sadness group
+        'sadness': 'sadness',
+        'disappointment': 'sadness',
+        'embarrassment': 'sadness',
+        'grief': 'sadness',
+        'remorse': 'sadness',
+        
+        # Anger group
+        'anger': 'anger',
+        'annoyance': 'anger',
+        'disapproval': 'anger',
+        'disgust': 'anger',
+        
+        # Fear group
+        'fear': 'fear',
+        'nervousness': 'fear',
+        'anxiety': 'fear',
+        
+        # Surprise group
+        'surprise': 'surprise',
+        'realization': 'surprise',
+        'confusion': 'surprise',
+        'curiosity': 'surprise',
+        
+        # Neutral/other - map to most appropriate
+        'neutral': 'joy',  # Default to joy, or you can add 'neutral' as 7th class
+    }
+    
+    # Return mapped value, default to 'joy' if not found
+    return mapping.get(emotion_27.lower(), 'joy')
+
+
 def emotion_data_pipeline(data_path: str = None):
     """
-    End-to-end data preprocessing pipeline.
-    Matches notebook workflow: Load → Clean → Normalize → Split
+    End-to-end data preprocessing pipeline with 3-task support.
     
     Returns:
-        Tuple of (train_data, val_data, label_encoder)
+        Tuple of (train_data, val_data, label_encoder_27, label_encoder_6)
+        where:
+        - train_data: dict with 'texts', 'emo_ids', 'hid_ids', 'hidden6_ids', 'emojis'
+        - val_data: dict with 'texts', 'emo_ids', 'hid_ids', 'hidden6_ids', 'emojis'
+        - label_encoder_27: sklearn LabelEncoder for 27-class emotions
+        - label_encoder_6: sklearn LabelEncoder for 6-class hidden emotions
     """
     data_paths = get_data_paths()
     emotion_categories = get_emotion_categories()
@@ -41,7 +97,7 @@ def emotion_data_pipeline(data_path: str = None):
         data_path = data_paths.get('raw_data', 'merged_full_dataset.csv')
     
     logger.info("=" * 60)
-    logger.info("EMOTION DATA PREPROCESSING PIPELINE")
+    logger.info("EMOTION DATA PREPROCESSING PIPELINE (3-TASK)")
     logger.info("=" * 60)
     logger.info(f"Loading data from: {data_path}")
     
@@ -61,38 +117,56 @@ def emotion_data_pipeline(data_path: str = None):
     df["text"] = df["text"].str.replace(r"\s+", " ", regex=True)
     
     # Step 3: Normalize emotion labels - USING SHARED FUNCTION
-    logger.info("Normalizing emotion labels...")
+    logger.info("Normalizing 27-class emotion labels...")
     df["hidden_emotion_label"] = df["hidden_emotion_label"].apply(normalize_emotion_label)
     df = df[df["hidden_emotion_label"].notna()].reset_index(drop=True)
     logger.info(f"After normalization: {len(df)} samples")
     
-    # Step 4: Extract primary emoji if not present - USING SHARED FUNCTION
+    # Step 4: Create 6-class hidden emotion labels (NEW)
+    logger.info("Creating 6-class hidden emotion labels...")
+    df["hidden_6_label"] = df["hidden_emotion_label"].apply(map_to_6_classes)
+    
+    # Log 6-class distribution
+    logger.info("\n6-class emotion distribution:")
+    logger.info(df["hidden_6_label"].value_counts().to_string())
+    
+    # Step 5: Extract primary emoji if not present
     if "primary_emoji" not in df.columns or df["primary_emoji"].isna().all():
         logger.info("Extracting primary emoji from text...")
         df["primary_emoji"] = df["text"].apply(extract_primary_emoji)
     
-    # Step 5: Encode labels
-    logger.info("Encoding emotion labels...")
-    le = LabelEncoder()
-    df["emotion_id"] = le.fit_transform(df["hidden_emotion_label"])
+    # Step 6: Encode 27-class labels
+    logger.info("Encoding 27-class emotion labels...")
+    le_27 = LabelEncoder()
+    df["emotion_id"] = le_27.fit_transform(df["hidden_emotion_label"])
+    
+    # Step 7: Encode 6-class hidden emotion labels (NEW)
+    logger.info("Encoding 6-class hidden emotion labels...")
+    le_6 = LabelEncoder()
+    df["hidden_6_id"] = le_6.fit_transform(df["hidden_6_label"])
+    
+    # Step 8: Binary hidden flag
     df["hidden_flag_id"] = df["hidden_emotion_flag"].astype(int)
     
-    logger.info(f"Label order: {list(le.classes_)}")
-    logger.info("\nClass distribution:")
+    logger.info(f"\n27-class label order: {list(le_27.classes_)}")
+    logger.info(f"6-class label order: {list(le_6.classes_)}")
+    
+    logger.info("\n27-class distribution:")
     logger.info(df["hidden_emotion_label"].value_counts().to_string())
     
-    # Step 6: Train/Val split with stratification
+    # Step 9: Train/Val split with stratification on 27-class
     logger.info("\n" + "=" * 60)
     logger.info("SPLITTING DATA")
     logger.info("=" * 60)
     
-    X_train, X_val, y_train_em, y_val_em, y_train_hid, y_val_hid = train_test_split(
+    X_train, X_val, y_train_em, y_val_em, y_train_hid, y_val_hid, y_train_h6, y_val_h6 = train_test_split(
         df["text"],
         df["emotion_id"],
         df["hidden_flag_id"],
+        df["hidden_6_id"],
         test_size=0.2,
         random_state=42,
-        stratify=df["emotion_id"],
+        stratify=df["emotion_id"],  # Stratify on 27-class
     )
     
     train_emojis = df.loc[X_train.index, "primary_emoji"].values
@@ -101,30 +175,44 @@ def emotion_data_pipeline(data_path: str = None):
     logger.info(f"Training samples: {len(X_train)}")
     logger.info(f"Validation samples: {len(X_val)}")
     
-    # Prepare return data
+    # Prepare return data with 3 labels (27-class, binary flag, 6-class)
     train_data = {
         'texts': X_train.values.tolist(),
-        'emo_ids': y_train_em.values.tolist(),
-        'hid_ids': y_train_hid.values.tolist(),
+        'emo_ids': y_train_em.values.tolist(),        # 27-class
+        'hid_ids': y_train_hid.values.tolist(),       # binary flag
+        'hidden6_ids': y_train_h6.values.tolist(),    # 6-class hidden (NEW)
         'emojis': train_emojis.tolist(),
     }
     
     val_data = {
         'texts': X_val.values.tolist(),
-        'emo_ids': y_val_em.values.tolist(),
-        'hid_ids': y_val_hid.values.tolist(),
+        'emo_ids': y_val_em.values.tolist(),          # 27-class
+        'hid_ids': y_val_hid.values.tolist(),         # binary flag
+        'hidden6_ids': y_val_h6.values.tolist(),      # 6-class hidden (NEW)
         'emojis': val_emojis.tolist(),
     }
     
     logger.info("\n" + "=" * 60)
     logger.info("DATA PREPROCESSING COMPLETE")
     logger.info("=" * 60)
+    logger.info(f"Train data keys: {list(train_data.keys())}")
+    logger.info(f"Train samples: {len(train_data['texts'])}")
+    logger.info(f"Val samples: {len(val_data['texts'])}")
     
-    return train_data, val_data, le
+    # Return 4 values: train_data, val_data, 27-class encoder, 6-class encoder
+    return train_data, val_data, le_27, le_6
 
 
 if __name__ == "__main__":
-    train_data, val_data, le = emotion_data_pipeline()
+    train_data, val_data, le_27, le_6 = emotion_data_pipeline()
     logger.info(f"\nTrain data keys: {train_data.keys()}")
-    logger.info(f"Val data keys: {val_data.keys()}")
-    logger.info(f"Label encoder classes: {list(le.classes_)}")
+    logger.info(f"27-class encoder classes: {list(le_27.classes_)}")
+    logger.info(f"6-class encoder classes: {list(le_6.classes_)}")
+    
+    # Quick validation
+    logger.info(f"\nSample train item:")
+    logger.info(f"  Text: {train_data['texts'][0][:50]}...")
+    logger.info(f"  27-class ID: {train_data['emo_ids'][0]}")
+    logger.info(f"  Binary flag: {train_data['hid_ids'][0]}")
+    logger.info(f"  6-class ID: {train_data['hidden6_ids'][0]}")
+    logger.info(f"  Emoji: {train_data['emojis'][0]}")

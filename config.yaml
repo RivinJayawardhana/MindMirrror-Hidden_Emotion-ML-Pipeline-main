@@ -41,42 +41,46 @@ model:
   freeze_layers: 1  # Reduced from 2 - allow more layers to train
 
 training:
-  num_epochs: 5
-  batch_size: 32
-  val_batch_size: 64
-  learning_rate_encoder: 5e-6  # Further reduced for stability (was causing NaN)
-  learning_rate_head: 1e-5     # Further reduced for stability
-  weight_decay: 0.01
-  max_grad_norm: 1.0
-  warmup_steps: 0.1  # Fraction of total steps
-  scheduler_type: "cosine"  # cosine or linear
+  num_epochs: 12                    # +2 epochs, let early stopping decide
+  batch_size: 24                    # ↓16, more stable gradients
+  val_batch_size: 64                # keep
   
-  # Early stopping
+  # ↑ Learning rates (your 5e-6 too low for DeBERTa)
+  learning_rate_encoder: 2e-5       # standard DeBERTa fine-tune LR
+  learning_rate_head: 5e-5          # 2.5x encoder (heads adapt faster)
+  
+  weight_decay: 0.01                # keep
+  max_grad_norm: 1.0                # keep
+  
+  warmup_steps: 0.08                # ↓2%, faster ramp-up
+  scheduler_type: "cosine"          # keep
+  
+  # Early stopping - better metric
   early_stopping:
     enabled: true
-    patience: 5  # Increased patience
-    monitor: "val_emo_accuracy"  # val_loss, val_emo_accuracy, val_hid_accuracy
-    mode: "max"  # max or min
+    patience: 4                     # ↓1, more responsive
+    monitor: "val_emo_macro_f1"     # ↑ F1 > accuracy for imbalance
+    mode: "max"
   
-  # Class imbalance handling
+  # Class weights - more aggressive
   class_weights:
-    method: "effective_num"  # effective_num, inverse_freq, or none
-    beta: 0.999  # Smoothing factor for effective number
+    method: "effective_num"
+    beta: 0.99                      # ↓0.009, stronger reweighting
   
-  # Loss function
+  # Loss - more focused
   loss:
-    focal_gamma: 1.5
-    hidden_weight: 0.5  # Reduced to balance tasks better
-    label_smoothing: 0.05  # Reduced label smoothing
-    pos_weight: 1.5  # Reduced pos_weight for hidden flag
+    focal_gamma: 2.0                # ↑0.5, harder on easy examples
+    hidden_weight: 0.8              # ↑0.3, hidden task more important
+    label_smoothing: 0.02           # ↓0.03, less aggressive
+    pos_weight: 2.2                 # ↑0.7, hidden minority class
   
-  # Data augmentation
+  # Augmentation - more aggressive on minorities
   augmentation:
     enabled: true
-    probability: 0.3
-    minority_classes: [3, 4, 5]  # fear, love, surprise indices
+    probability: 0.4                # ↑0.1
+    minority_classes: [2, 3, 4, 5]  # add anger (usually imbalanced)
   
-  # Data split
+  # Data split - keep stable
   train_val_split:
     test_size: 0.2
     random_state: 42

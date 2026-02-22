@@ -1,6 +1,6 @@
 """
-Training pipeline with transformer fine-tuning.
-Enhanced with accuracy improvements from research best practices.
+Training pipeline with transformer fine-tuning for multi-task emotion detection.
+Tasks: 27-class emotion | binary hidden flag | 6-class hidden emotion
 """
 import os
 import sys
@@ -15,10 +15,8 @@ from functools import partial
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import (
     AutoTokenizer, 
-    get_cosine_schedule_with_warmup, 
-    get_linear_schedule_with_warmup,
-    get_cosine_with_hard_restarts_schedule_with_warmup,
-    DataCollatorWithPadding
+    AutoModel,
+    get_cosine_with_hard_restarts_schedule_with_warmup
 )
 from sklearn.metrics import (
     classification_report,
@@ -26,8 +24,6 @@ from sklearn.metrics import (
     accuracy_score,
     f1_score,
     roc_auc_score,
-    precision_score,
-    recall_score,
     precision_recall_fscore_support
 )
 import logging
@@ -37,13 +33,12 @@ import random
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from utils.config import load_config, get_data_paths, get_emotion_categories
+from utils.config import load_config, get_data_paths
 from utils.model_loader import get_pretrained_model_path, get_pretrained_tokenizer_path
-from src.emotion_model import EnhancedEmotionHiddenModel, EnhancedMultitaskLoss
-from pipelines.emotion_data_pipeline import emotion_data_pipeline
 from utils.mlflow_utils import init_mlflow, log_pytorch_model, log_label_encoder, log_training_config
 from src.preprocessing import EmotionHiddenDataset, build_input
 import mlflow
+from pipelines.emotion_data_pipeline import emotion_data_pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# IMPROVEMENT 1: Advanced Data Augmentation
+# ADVANCED DATA AUGMENTATION
 # ============================================================================
 
 class AdvancedAugmentation:
@@ -62,7 +57,6 @@ class AdvancedAugmentation:
         self.tokenizer = tokenizer
         self.p = p
         
-        # Synonym replacement dictionary
         self.synonyms = {
             'happy': ['joyful', 'glad', 'pleased', 'delighted'],
             'sad': ['unhappy', 'down', 'depressed', 'gloomy'],
@@ -75,7 +69,6 @@ class AdvancedAugmentation:
         }
     
     def random_deletion(self, text, p=0.2):
-        """Randomly delete words with probability p"""
         words = text.split()
         if len(words) == 1:
             return text
@@ -83,7 +76,6 @@ class AdvancedAugmentation:
         return ' '.join(new_words) if new_words else random.choice(words)
     
     def random_swap(self, text, n=2):
-        """Randomly swap two words n times"""
         words = text.split()
         if len(words) < 2:
             return text
@@ -93,7 +85,6 @@ class AdvancedAugmentation:
         return ' '.join(words)
     
     def synonym_replacement(self, text):
-        """Replace words with synonyms"""
         words = text.split()
         new_words = []
         for word in words:
@@ -104,11 +95,9 @@ class AdvancedAugmentation:
         return ' '.join(new_words)
     
     def augment(self, text, emotion_id, minority_classes):
-        """Apply augmentation if sample is from minority class"""
         if emotion_id not in minority_classes or random.random() > self.p:
             return text
         
-        # Choose random augmentation
         aug_type = random.choice(['delete', 'swap', 'synonym', 'prefix', 'suffix'])
         
         if aug_type == 'delete':
@@ -118,20 +107,14 @@ class AdvancedAugmentation:
         elif aug_type == 'synonym':
             return self.synonym_replacement(text)
         elif aug_type == 'prefix':
-            prefixes = [
-                "I feel", "Honestly,", "To be honest,", 
-                "I think", "In my opinion,", "Personally,"
-            ]
+            prefixes = ["I feel", "Honestly,", "To be honest,", "I think", "In my opinion,", "Personally,"]
             return f"{random.choice(prefixes)} {text}"
-        else:  # suffix
-            suffixes = [
-                " right now", " today", " honestly",
-                " tbh", " tbh", " tbh"
-            ]
+        else:
+            suffixes = [" right now", " today", " honestly", " tbh", " tbh", " tbh"]
             return f"{text}{random.choice(suffixes)}"
 
 # ============================================================================
-# IMPROVEMENT 2: MixUp for Emotion Classification
+# MIXUP AUGMENTATION
 # ============================================================================
 
 class MixUp:
@@ -140,34 +123,649 @@ class MixUp:
     def __init__(self, alpha=0.2):
         self.alpha = alpha
     
-    def mixup(self, x1, x2, y1, y2):
-        """Apply mixup to two samples"""
+    def mixup(self, x1, x2, y1, y2, y3_1, y3_2):
+        """Apply mixup to two samples (3 tasks)"""
         lam = np.random.beta(self.alpha, self.alpha)
         
-        # Mix inputs (for embeddings, not raw text)
         mixed_x = lam * x1 + (1 - lam) * x2
+        mixed_y1 = lam * y1 + (1 - lam) * y2  # 27-class
+        mixed_y2 = lam * y3_1 + (1 - lam) * y3_2  # hidden flag
+        mixed_y3 = lam * y3_1 + (1 - lam) * y3_2  # 6-class hidden
         
-        # Mix labels
-        mixed_y = lam * y1 + (1 - lam) * y2
-        
-        return mixed_x, mixed_y, lam
+        return mixed_x, mixed_y1, mixed_y2, mixed_y3, lam
 
 # ============================================================================
-# IMPROVEMENT 3: Advanced Optimizer with Layer-wise Learning Rate Decay
+# 1. MODEL UPGRADE - WITH 3 TASKS AND EMOJI EMBEDDING FUSION
+# ============================================================================
+
+class EnhancedEmotionHiddenModel(nn.Module):
+    """
+    Multi-task transformer model for:
+    1. 27-class emotion classification
+    2. Binary hidden emotion flag detection
+    3. 6-class hidden emotion classification
+    """
+    
+    def __init__(self, base_model_name: str, num_emotions: int = 27, num_hidden6: int = 6,
+                 dropout_p: float = 0.3, local_model_path: str = None,
+                 use_gradient_checkpointing: bool = False, hidden_size_factor: int = 2):
+        super().__init__()
+        
+        load_path = local_model_path if local_model_path else base_model_name
+        try:
+            self.encoder = AutoModel.from_pretrained(load_path, use_safetensors=True)
+        except OSError:
+            self.encoder = AutoModel.from_pretrained(load_path, use_safetensors=False)
+        
+        if use_gradient_checkpointing and hasattr(self.encoder, 'gradient_checkpointing_enable'):
+            self.encoder.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
+        
+        hidden_size = self.encoder.config.hidden_size
+        expanded_size = hidden_size * hidden_size_factor
+        
+        logger.info(f"Loaded encoder: {load_path} (hidden_size={hidden_size})")
+        
+        # Emoji emotion embedding (6-class hidden emotion → embedding)
+        self.emoji_emotion_embedding = nn.Embedding(num_hidden6, 16)
+        
+        # Attention-based pooling
+        self.attention_pooling = nn.Sequential(
+            nn.Linear(hidden_size, 1),
+            nn.Tanh()
+        )
+        
+        # Shared projection with residual (now takes concatenated features)
+        self.shared_projection = nn.Sequential(
+            nn.Linear(hidden_size + 16, expanded_size),
+            nn.LayerNorm(expanded_size),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(expanded_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(dropout_p / 2)
+        )
+        
+        # 27-class emotion head
+        self.emotion_head = nn.Sequential(
+            nn.Linear(hidden_size, expanded_size),
+            nn.LayerNorm(expanded_size),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(expanded_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout_p / 2),
+            nn.Linear(hidden_size, num_emotions),
+        )
+        
+        # Hidden flag head (binary)
+        self.hidden_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout_p / 2),
+            nn.Linear(hidden_size // 2, 64),
+            nn.GELU(),
+            nn.Dropout(dropout_p / 4),
+            nn.Linear(64, 1),
+        )
+        
+        # 6-class hidden emotion head (NEW)
+        self.hidden6_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.GELU(),
+            nn.Dropout(dropout_p / 2),
+            nn.Linear(hidden_size // 4, num_hidden6),
+        )
+        
+        # Temperature scaling for calibration
+        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in [self.emotion_head, self.hidden_head, self.hidden6_head,
+                       self.shared_projection, self.attention_pooling]:
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=1.0)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+                elif isinstance(layer, nn.LayerNorm):
+                    nn.init.ones_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+        
+        nn.init.orthogonal_(self.emoji_emotion_embedding.weight)
+        nn.init.constant_(self.temperature, 1.5)
+    
+    def forward(self, input_ids, attention_mask, emoji_emotion_ids=None):
+        """
+        Args:
+            input_ids: Tokenized input IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            emoji_emotion_ids: 6-class emotion IDs for emoji [batch_size] (optional)
+        """
+        # Get encoder outputs
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        
+        # Advanced pooling: weighted average based on token importance
+        attention_weights = self.attention_pooling(hidden_states).squeeze(-1)
+        attention_weights = attention_weights.masked_fill(~attention_mask.bool(), float('-inf'))
+        attention_weights = F.softmax(attention_weights, dim=-1).unsqueeze(-1)
+        pooled = (hidden_states * attention_weights).sum(dim=1)
+        
+        # Fallback to mean pooling if attention pooling fails
+        if torch.isnan(pooled).any():
+            attention_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+            sum_embeddings = torch.sum(hidden_states * attention_mask_expanded, dim=1)
+            sum_mask = torch.clamp(attention_mask_expanded.sum(dim=1), min=1e-9)
+            pooled = sum_embeddings / sum_mask
+        
+        pooled = torch.clamp(pooled, min=-10.0, max=10.0)
+        
+        # Emoji emotion embedding fusion (if available)
+        if emoji_emotion_ids is not None:
+            emoji_embed = self.emoji_emotion_embedding(emoji_emotion_ids)  # [batch_size, 16]
+            # Concatenate with pooled features
+            combined = torch.cat([pooled, emoji_embed], dim=-1)  # [batch_size, hidden_size + 16]
+        else:
+            # Pad with zeros if no emoji emotion ids
+            combined = torch.cat([pooled, torch.zeros(pooled.size(0), 16).to(pooled.device)], dim=-1)
+        
+        # Shared features with residual
+        shared_features = self.shared_projection(combined)
+        shared_features = shared_features + pooled  # Residual on original pooled
+        
+        # Separate heads with temperature scaling
+        emo_logits = self.emotion_head(shared_features) / self.temperature
+        hid_logits = self.hidden_head(shared_features).squeeze(-1)
+        hidden6_logits = self.hidden6_head(shared_features)  # NEW: 6-class logits
+        
+        return emo_logits, hid_logits, hidden6_logits
+    
+    def freeze_encoder_layers(self, num_layers: int = 2):
+        """Freeze first N layers of the encoder"""
+        frozen_count = 0
+        for name, param in self.encoder.named_parameters():
+            if "embeddings" in name:
+                param.requires_grad = False
+                frozen_count += 1
+            for i in range(num_layers):
+                if f"encoder.layer.{i}" in name:
+                    param.requires_grad = False
+                    frozen_count += 1
+        
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        logger.info(f"Frozen {frozen_count} parameter groups")
+        logger.info(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+
+# ============================================================================
+# 2. LOSS UPGRADE - 3 TASKS WITH UNCERTAINTY WEIGHTING
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss for multi-class tasks"""
+    
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.1, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logits = torch.where(torch.isnan(logits) | torch.isinf(logits),
+                                torch.zeros_like(logits), logits)
+        
+        num_classes = logits.size(-1)
+        
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                smooth_targets = torch.zeros_like(logits).scatter_(
+                    1, targets.unsqueeze(1), 1.0
+                )
+                smooth_targets = smooth_targets * (1 - self.label_smoothing) + self.label_smoothing / num_classes
+        
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        if self.label_smoothing > 0:
+            ce_loss = -(smooth_targets * log_probs).sum(dim=-1)
+        else:
+            ce_loss = F.nll_loss(log_probs, targets, reduction='none')
+        
+        ce_loss = torch.clamp(ce_loss, min=0.0, max=10.0)
+        pt = torch.exp(-ce_loss)
+        pt = torch.clamp(pt, min=1e-7, max=1.0 - 1e-7)
+        
+        focal_weight = (1 - pt) ** self.gamma
+        
+        if self.alpha is not None:
+            alpha_weight = self.alpha[targets]
+            focal_weight = focal_weight * alpha_weight
+        
+        loss = focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            loss = loss.mean()
+        elif self.reduction == 'sum':
+            loss = loss.sum()
+        
+        return loss
+
+
+class EnhancedMultitaskLoss(nn.Module):
+    """
+    Multi-task loss with uncertainty weighting for 3 tasks:
+    1. 27-class emotion classification
+    2. Binary hidden flag detection
+    3. 6-class hidden emotion classification
+    """
+    
+    def __init__(self, class_weights_dict: dict, gamma: float = 2.0,
+                 hidden_weight: float = 0.8, hidden6_weight: float = 0.6,
+                 pos_weight: float = 2.0, label_smoothing: float = 0.1,
+                 device: str = "cuda", use_uncertainty_weighting: bool = True):
+        super().__init__()
+        
+        # Task weights (can be used if uncertainty weighting is disabled)
+        self.hidden_weight = hidden_weight
+        self.hidden6_weight = hidden6_weight
+        
+        # 27-class emotion loss
+        num_classes = len(class_weights_dict)
+        alpha_tensor = torch.zeros(num_classes)
+        for idx, weight in class_weights_dict.items():
+            alpha_tensor[idx] = weight
+        alpha_tensor = alpha_tensor / alpha_tensor.sum() * num_classes
+        alpha_tensor = alpha_tensor.to(device)
+        
+        self.emo_loss = FocalLoss(
+            alpha=alpha_tensor,
+            gamma=gamma,
+            label_smoothing=label_smoothing
+        )
+        
+        # Binary hidden flag loss
+        self.hid_loss = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight], dtype=torch.float32).to(device)
+        )
+        
+        # 6-class hidden emotion loss
+        self.hidden6_loss = FocalLoss(
+            alpha=None,  # Can add class weights for 6-class if needed
+            gamma=gamma,
+            label_smoothing=label_smoothing
+        )
+        
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+        
+        # Learnable task uncertainty (log variance) for 3 tasks
+        if use_uncertainty_weighting:
+            self.log_emotion_var = nn.Parameter(torch.zeros(1, device=device))
+            self.log_hidden_var = nn.Parameter(torch.zeros(1, device=device))
+            self.log_hidden6_var = nn.Parameter(torch.zeros(1, device=device))
+    
+    def forward(self, emo_logits, emo_targets, hid_logits, hid_targets,
+                hidden6_logits, hidden6_targets):
+        """
+        Compute multi-task loss with optional uncertainty weighting.
+        
+        Args:
+            emo_logits: 27-class emotion logits [batch_size, 27]
+            emo_targets: 27-class targets [batch_size]
+            hid_logits: Binary hidden flag logits [batch_size]
+            hid_targets: Binary targets [batch_size]
+            hidden6_logits: 6-class hidden emotion logits [batch_size, 6]
+            hidden6_targets: 6-class targets [batch_size]
+        """
+        l_emo = self.emo_loss(emo_logits, emo_targets)
+        
+        hid_targets_float = hid_targets.float() if hid_targets.dtype != torch.float32 else hid_targets
+        l_hid = self.hid_loss(hid_logits, hid_targets_float)
+        
+        l_hidden6 = self.hidden6_loss(hidden6_logits, hidden6_targets)
+        
+        if self.use_uncertainty_weighting:
+            # Uncertainty weighting: L = sum(L_i * exp(-s_i) + s_i)
+            precision_emo = torch.exp(-self.log_emotion_var)
+            precision_hid = torch.exp(-self.log_hidden_var)
+            precision_hid6 = torch.exp(-self.log_hidden6_var)
+            
+            total_loss = (precision_emo * l_emo + self.log_emotion_var +
+                         precision_hid * l_hid + self.log_hidden_var +
+                         precision_hid6 * l_hidden6 + self.log_hidden6_var)
+        else:
+            total_loss = l_emo + self.hidden_weight * l_hid + self.hidden6_weight * l_hidden6
+        
+        return total_loss, l_emo, l_hid, l_hidden6
+
+# ============================================================================
+# 3. DATASET/COLLATE UPGRADE - ADD HIDDEN6_LABELS
+# ============================================================================
+
+class EmotionHiddenDataset(Dataset):
+    """Dataset with 27-class emotion, binary hidden flag, and 6-class hidden emotion"""
+    
+    def __init__(self, texts, emo_ids, hid_ids, hidden6_ids, emojis,
+                 augment=False, minority_classes=None):
+        self.texts = list(texts)
+        self.emo_ids = list(emo_ids)          # 27-class
+        self.hid_ids = list(hid_ids)           # binary flag
+        self.hidden6_ids = list(hidden6_ids)   # 6-class hidden emotion (NEW)
+        self.emojis = list(emojis)
+        self.augment = augment
+        self.minority_classes = minority_classes or [3, 4, 5]
+        self.class_distribution = Counter(emo_ids)
+        
+        logger.info(f"Created dataset with {len(self.texts)} samples")
+        logger.info(f"27-class distribution: {dict(self.class_distribution)}")
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        raw_text = self.texts[idx]
+        emoji_char = self.emojis[idx] if idx < len(self.emojis) else ""
+        emotion_id = self.emo_ids[idx]
+        hidden6_id = self.hidden6_ids[idx]  # NEW
+        
+        # Simple text augmentation for minority classes
+        if self.augment and np.random.random() < 0.3:
+            if emotion_id in self.minority_classes:
+                variations = [
+                    f"I feel {raw_text}",
+                    f"{raw_text} honestly",
+                    f"To be honest, {raw_text}",
+                    f"{raw_text} right now"
+                ]
+                raw_text = np.random.choice(variations)
+        
+        proc_text = build_input(raw_text, emoji_char)
+        return proc_text, emotion_id, self.hid_ids[idx], hidden6_id  # Added hidden6_id
+
+
+def collate_fn(batch, tokenizer, max_length: int = 128):
+    """
+    Collate function with 3 labels: emotion, hidden_flag, hidden6
+    """
+    texts, emo_ids, hid_ids, hidden6_ids = zip(*batch)
+    
+    enc = tokenizer(
+        list(texts),
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    
+    enc["emotion_labels"] = torch.tensor(emo_ids, dtype=torch.long)        # 27-class
+    enc["hidden_labels"] = torch.tensor(hid_ids, dtype=torch.float)        # binary flag
+    enc["hidden6_labels"] = torch.tensor(hidden6_ids, dtype=torch.long)    # 6-class (NEW)
+    
+    return enc
+
+# ============================================================================
+# 4. FEATURE FUSION - Already included in model above
+# ============================================================================
+# The emoji_emotion embedding fusion is integrated in the model forward method
+# It takes emoji_emotion_ids (6-class) and fuses with CLS via concatenation
+
+# ============================================================================
+# 5. EVALUATION UPGRADE - ADD 6-CLASS METRICS
+# ============================================================================
+
+def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", use_amp=False):
+    """
+    Enhanced evaluation with 3-task metrics
+    """
+    model.eval()
+    
+    # 27-class emotion metrics
+    all_true_emo, all_pred_emo = [], []
+    all_emo_probs = []
+    
+    # Binary hidden flag metrics
+    all_true_hid, all_pred_hid = [], []
+    all_hid_probs = []
+    
+    # 6-class hidden emotion metrics (NEW)
+    all_true_hidden6, all_pred_hidden6 = [], []
+    all_hidden6_probs = []
+    
+    all_confidences = []
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            # Move to device with correct dtypes
+            input_ids = batch["input_ids"].to(device).long()
+            attention_mask = batch["attention_mask"].to(device).float()
+            emotion_labels = batch["emotion_labels"].to(device).long()
+            hidden_labels = batch["hidden_labels"].to(device).float()
+            hidden6_labels = batch["hidden6_labels"].to(device).long()  # NEW
+            
+            # Forward pass
+            emo_logits, hid_logits, hidden6_logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+                # emoji_emotion_ids not used in eval (can be added if available)
+            )
+            
+            if criterion is not None:
+                loss, l_emo, l_hid, l_hid6 = criterion(
+                    emo_logits, emotion_labels,
+                    hid_logits, hidden_labels,
+                    hidden6_logits, hidden6_labels
+                )
+                total_loss += loss.item()
+                num_batches += 1
+            
+            # 27-class predictions
+            emo_probs = F.softmax(emo_logits, dim=-1)
+            emo_preds = emo_logits.argmax(dim=-1)
+            
+            # Binary flag predictions
+            hid_probs = torch.sigmoid(hid_logits)
+            hid_preds = (hid_probs > 0.5).long()
+            
+            # 6-class hidden emotion predictions (NEW)
+            hidden6_probs = F.softmax(hidden6_logits, dim=-1)
+            hidden6_preds = hidden6_logits.argmax(dim=-1)
+            
+            # Confidence (max probability of 27-class)
+            confidences = emo_probs.max(dim=-1)[0]
+            
+            # Store 27-class
+            all_true_emo.extend(emotion_labels.cpu().numpy())
+            all_pred_emo.extend(emo_preds.cpu().numpy())
+            all_emo_probs.extend(emo_probs.cpu().numpy())
+            
+            # Store binary flag
+            all_true_hid.extend(hidden_labels.cpu().numpy())
+            all_pred_hid.extend(hid_preds.cpu().numpy())
+            all_hid_probs.extend(hid_probs.cpu().numpy())
+            
+            # Store 6-class (NEW)
+            all_true_hidden6.extend(hidden6_labels.cpu().numpy())
+            all_pred_hidden6.extend(hidden6_preds.cpu().numpy())
+            all_hidden6_probs.extend(hidden6_probs.cpu().numpy())
+            
+            all_confidences.extend(confidences.cpu().numpy())
+    
+    # Convert to numpy arrays
+    all_true_emo = np.array(all_true_emo)
+    all_pred_emo = np.array(all_pred_emo)
+    all_true_hid = np.array(all_true_hid)
+    all_pred_hid = np.array(all_pred_hid)
+    all_true_hidden6 = np.array(all_true_hidden6)
+    all_pred_hidden6 = np.array(all_pred_hidden6)
+    all_confidences = np.array(all_confidences)
+    
+    # =======================================================================
+    # 27-CLASS EMOTION METRICS
+    # =======================================================================
+    print("\n" + "=" * 70)
+    print("27-CLASS EMOTION CLASSIFICATION REPORT")
+    print("=" * 70)
+    
+    unique_classes = np.unique(np.concatenate([all_true_emo, all_pred_emo]))
+    target_names = [f"class_{i}" for i in unique_classes]
+    print(classification_report(
+        all_true_emo, all_pred_emo,
+        labels=unique_classes, target_names=target_names,
+        digits=4, zero_division=0
+    ))
+    
+    # Per-class accuracy
+    print("\nPER-CLASS ACCURACY (27-class):")
+    cm_emo = confusion_matrix(all_true_emo, all_pred_emo, labels=unique_classes)
+    for i, class_id in enumerate(unique_classes):
+        total = cm_emo[i].sum()
+        correct = cm_emo[i, i]
+        acc = correct / total if total > 0 else 0
+        print(f"Class {int(class_id):2d}: {acc:.4f} ({correct}/{total})")
+    
+    macro_acc = accuracy_score(all_true_emo, all_pred_emo)
+    macro_f1 = f1_score(all_true_emo, all_pred_emo, average='macro', zero_division=0)
+    weighted_f1 = f1_score(all_true_emo, all_pred_emo, average='weighted', zero_division=0)
+    
+    print(f"\nOverall Accuracy:  {macro_acc:.4f}")
+    print(f"Macro F1-Score:    {macro_f1:.4f}")
+    print(f"Weighted F1-Score: {weighted_f1:.4f}")
+    
+    # =======================================================================
+    # BINARY HIDDEN FLAG METRICS
+    # =======================================================================
+    print("\n" + "=" * 70)
+    print("BINARY HIDDEN FLAG DETECTION")
+    print("=" * 70)
+    
+    acc_hid = accuracy_score(all_true_hid, all_pred_hid)
+    prec_hid, rec_hid, f1_hid, _ = precision_recall_fscore_support(
+        all_true_hid, all_pred_hid,
+        average="binary", pos_label=1, zero_division=0
+    )
+    
+    print(f"Accuracy:  {acc_hid:.4f}")
+    print(f"Precision: {prec_hid:.4f}")
+    print(f"Recall:    {rec_hid:.4f}")
+    print(f"F1-Score:  {f1_hid:.4f}")
+    
+    try:
+        hid_auc = roc_auc_score(all_true_hid, all_hid_probs)
+        print(f"AUC:       {hid_auc:.4f}")
+    except:
+        hid_auc = 0.0
+    
+    cm_hid = confusion_matrix(all_true_hid, all_pred_hid)
+    print(f"\nConfusion Matrix:")
+    print(f"              Predicted")
+    print(f"              Neg    Pos")
+    print(f"Actual Neg    {cm_hid[0,0]:4d}  {cm_hid[0,1]:4d}")
+    print(f"       Pos    {cm_hid[1,0]:4d}  {cm_hid[1,1]:4d}")
+    
+    # =======================================================================
+    # 6-CLASS HIDDEN EMOTION METRICS (NEW)
+    # =======================================================================
+    print("\n" + "=" * 70)
+    print("6-CLASS HIDDEN EMOTION CLASSIFICATION REPORT")
+    print("=" * 70)
+    
+    # Define emotion names (customize based on your mapping)
+    emotion_names = ['joy', 'sadness', 'anger', 'fear', 'surprise', 'love']
+    
+    unique_h6 = np.unique(np.concatenate([all_true_hidden6, all_pred_hidden6]))
+    h6_target_names = [emotion_names[i] if i < len(emotion_names) else f"class_{i}" for i in unique_h6]
+    
+    print(classification_report(
+        all_true_hidden6, all_pred_hidden6,
+        labels=unique_h6, target_names=h6_target_names,
+        digits=4, zero_division=0
+    ))
+    
+    # Per-class accuracy for 6-class
+    print("\nPER-CLASS ACCURACY (6-class):")
+    cm_h6 = confusion_matrix(all_true_hidden6, all_pred_hidden6, labels=unique_h6)
+    for i, class_id in enumerate(unique_h6):
+        total = cm_h6[i].sum()
+        correct = cm_h6[i, i]
+        acc = correct / total if total > 0 else 0
+        emotion_name = emotion_names[class_id] if class_id < len(emotion_names) else f"class_{class_id}"
+        print(f"{emotion_name:10s} (id={int(class_id)}): {acc:.4f} ({correct}/{total})")
+    
+    macro_acc_h6 = accuracy_score(all_true_hidden6, all_pred_hidden6)
+    macro_f1_h6 = f1_score(all_true_hidden6, all_pred_hidden6, average='macro', zero_division=0)
+    weighted_f1_h6 = f1_score(all_true_hidden6, all_pred_hidden6, average='weighted', zero_division=0)
+    
+    print(f"\nOverall Accuracy (6-class):  {macro_acc_h6:.4f}")
+    print(f"Macro F1-Score (6-class):    {macro_f1_h6:.4f}")
+    print(f"Weighted F1-Score (6-class): {weighted_f1_h6:.4f}")
+    
+    # Confusion matrix for 6-class
+    print(f"\nConfusion Matrix (6-class):")
+    print("Rows: True, Columns: Predicted")
+    print("      " + " ".join([f"{emotion_names[i][:4]:4s}" for i in unique_h6]))
+    for i in range(len(cm_h6)):
+        row_str = f"{emotion_names[int(unique_h6[i])][:4]:4s} "
+        for j in range(len(cm_h6[i])):
+            row_str += f"{cm_h6[i,j]:4d} "
+        print(row_str)
+    
+    if criterion is not None and num_batches > 0:
+        avg_loss = total_loss / num_batches
+        print(f"\nValidation Loss: {avg_loss:.4f}")
+    
+    metrics = {
+        # 27-class metrics
+        "emo_accuracy": macro_acc,
+        "emo_macro_f1": macro_f1,
+        "emo_weighted_f1": weighted_f1,
+        
+        # Binary flag metrics
+        "hid_accuracy": acc_hid,
+        "hid_precision": prec_hid,
+        "hid_recall": rec_hid,
+        "hid_f1": f1_hid,
+        "hid_auc": hid_auc,
+        
+        # 6-class metrics (NEW)
+        "hidden6_accuracy": macro_acc_h6,
+        "hidden6_macro_f1": macro_f1_h6,
+        "hidden6_weighted_f1": weighted_f1_h6,
+        
+        "avg_confidence": np.mean(all_confidences),
+        "emo_probs": all_emo_probs,
+        "predictions": all_pred_emo,
+        "hidden6_predictions": all_pred_hidden6,
+        "hidden6_probs": all_hidden6_probs
+    }
+    
+    if criterion is not None:
+        metrics["loss"] = total_loss / max(num_batches, 1)
+    
+    return metrics
+
+# ============================================================================
+# LAYER-WISE LEARNING RATE DECAY
 # ============================================================================
 
 def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
-    """
-    Layer-wise learning rate decay
-    Lower layers get lower learning rates
-    """
+    """Layer-wise learning rate decay for 3-task model"""
     optimizer_grouped_parameters = []
     
-    # Get encoder layers if they exist
     if hasattr(model.encoder, 'encoder') and hasattr(model.encoder.encoder, 'layer'):
         layers = list(model.encoder.encoder.layer)
         
-        # Embeddings layer (lowest LR)
+        # Embeddings layer
         embeddings_params = list(model.encoder.embeddings.parameters())
         if embeddings_params:
             optimizer_grouped_parameters.append({
@@ -176,7 +774,7 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'embeddings'
             })
         
-        # Encoder layers with decreasing LR
+        # Encoder layers
         for i, layer in enumerate(layers):
             layer_params = list(layer.parameters())
             if layer_params:
@@ -187,8 +785,6 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                     'name': f'encoder_layer_{i}'
                 })
     else:
-        # Fallback for models without standard layer structure
-        logger.warning("Model does not have standard encoder layer structure, using all parameters with same LR")
         all_params = list(model.encoder.parameters())
         if all_params:
             optimizer_grouped_parameters.append({
@@ -197,7 +793,7 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'encoder'
             })
     
-    # Pooler parameters (if exists)
+    # Pooler
     if hasattr(model.encoder, 'pooler'):
         pooler_params = list(model.encoder.pooler.parameters())
         if pooler_params:
@@ -207,7 +803,7 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'pooler'
             })
     
-    # Shared projection parameters
+    # Shared projection
     if hasattr(model, 'shared_projection'):
         shared_params = list(model.shared_projection.parameters())
         if shared_params:
@@ -217,17 +813,17 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'shared_projection'
             })
     
-    # Emotion head parameters
+    # 27-class head
     if hasattr(model, 'emotion_head'):
         emotion_params = list(model.emotion_head.parameters())
         if emotion_params:
             optimizer_grouped_parameters.append({
                 'params': emotion_params,
-                'lr': base_lr * 2,  # Higher LR for task-specific heads
+                'lr': base_lr * 2,
                 'name': 'emotion_head'
             })
     
-    # Hidden head parameters
+    # Binary flag head
     if hasattr(model, 'hidden_head'):
         hidden_params = list(model.hidden_head.parameters())
         if hidden_params:
@@ -237,17 +833,33 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'hidden_head'
             })
     
-    # Temperature parameter
+    # 6-class head (NEW)
+    if hasattr(model, 'hidden6_head'):
+        hidden6_params = list(model.hidden6_head.parameters())
+        if hidden6_params:
+            optimizer_grouped_parameters.append({
+                'params': hidden6_params,
+                'lr': base_lr * 2,
+                'name': 'hidden6_head'
+            })
+    
+    # Emoji embedding
+    if hasattr(model, 'emoji_emotion_embedding'):
+        optimizer_grouped_parameters.append({
+            'params': [model.emoji_emotion_embedding.weight],
+            'lr': base_lr,
+            'name': 'emoji_embedding'
+        })
+    
+    # Temperature
     if hasattr(model, 'temperature') and model.temperature is not None:
         optimizer_grouped_parameters.append({
             'params': [model.temperature],
-            'lr': base_lr * 0.1,  # Very low LR for temperature
+            'lr': base_lr * 0.1,
             'name': 'temperature'
         })
     
-    # Ensure we have at least one parameter group
     if not optimizer_grouped_parameters:
-        # Fallback: use all parameters
         all_params = list(model.parameters())
         if all_params:
             optimizer_grouped_parameters.append({
@@ -267,195 +879,26 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
     )
 
 # ============================================================================
-# IMPROVEMENT 4: Advanced Evaluation with Confidence Analysis (FIXED dtype)
+# COSINE ANNEALING WITH WARM RESTARTS
 # ============================================================================
 
-def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", use_amp=False):
-    """
-    Enhanced evaluation with confidence analysis and per-class metrics
-    """
-    model.eval()
-    all_true_emo, all_pred_emo = [], []
-    all_true_hid, all_pred_hid = [], []
-    all_emo_probs = []
-    all_hid_probs = []
-    all_confidences = []
-    total_loss = 0.0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            # Move batch to device with correct dtypes
-            input_ids = batch["input_ids"].to(device).long()
-            attention_mask = batch["attention_mask"].to(device).float()
-            emotion_labels = batch["emotion_labels"].to(device).long()
-            hidden_labels = batch["hidden_labels"].to(device).float()
-            
-            # Forward pass
-            emo_logits, hid_logits = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
-            
-            if criterion is not None:
-                loss, _, _ = criterion(
-                    emo_logits, emotion_labels,
-                    hid_logits, hidden_labels
-                )
-                total_loss += loss.item()
-                num_batches += 1
-            
-            emo_probs = F.softmax(emo_logits, dim=-1)
-            hid_probs = torch.sigmoid(hid_logits)
-            
-            emo_preds = emo_logits.argmax(dim=-1)
-            hid_preds = (hid_probs > 0.5).long()
-            
-            # Calculate confidence (max probability)
-            confidences = emo_probs.max(dim=-1)[0]
-            
-            all_true_emo.extend(emotion_labels.cpu().numpy())
-            all_pred_emo.extend(emo_preds.cpu().numpy())
-            all_true_hid.extend(hidden_labels.cpu().numpy())
-            all_pred_hid.extend(hid_preds.cpu().numpy())
-            all_emo_probs.extend(emo_probs.cpu().numpy())
-            all_hid_probs.extend(hid_probs.cpu().numpy())
-            all_confidences.extend(confidences.cpu().numpy())
-    
-    # Convert to numpy arrays
-    all_true_emo = np.array(all_true_emo)
-    all_pred_emo = np.array(all_pred_emo)
-    all_true_hid = np.array(all_true_hid)
-    all_pred_hid = np.array(all_pred_hid)
-    all_confidences = np.array(all_confidences)
-    
-    # Calculate metrics
-    print("\n" + "=" * 70)
-    print("EMOTION CLASSIFICATION REPORT")
-    print("=" * 70)
-    
-    # Full classification report
-    unique_classes = np.unique(np.concatenate([all_true_emo, all_pred_emo]))
-    target_names = [f"class_{i}" for i in unique_classes]
-    print(classification_report(
-        all_true_emo,
-        all_pred_emo,
-        labels=unique_classes,
-        target_names=target_names,
-        digits=4,
-        zero_division=0
-    ))
-    
-    # Per-class accuracy with confidence
-    print("\n" + "-" * 70)
-    print("PER-CLASS ACCURACY & CONFIDENCE ANALYSIS")
-    print("-" * 70)
-    cm = confusion_matrix(all_true_emo, all_pred_emo, labels=unique_classes)
-    
-    class_metrics = {}
-    for i, class_id in enumerate(unique_classes):
-        total = cm[i].sum()
-        correct = cm[i, i]
-        acc = correct / total if total > 0 else 0
-        
-        # Average confidence for this class
-        class_mask = all_true_emo == class_id
-        if class_mask.any():
-            avg_conf = all_confidences[class_mask].mean()
-            correct_mask = (all_true_emo == class_id) & (all_pred_emo == class_id)
-            correct_conf = all_confidences[correct_mask].mean() if correct_mask.any() else 0
-            incorrect_mask = (all_true_emo == class_id) & (all_pred_emo != class_id)
-            incorrect_conf = all_confidences[incorrect_mask].mean() if incorrect_mask.any() else 0
-        else:
-            avg_conf = correct_conf = incorrect_conf = 0
-        
-        class_metrics[int(class_id)] = {
-            'accuracy': acc,
-            'avg_confidence': avg_conf,
-            'correct_confidence': correct_conf,
-            'incorrect_confidence': incorrect_conf
-        }
-        
-        print(f"Class {int(class_id):2d}: Acc={acc:.4f} | AvgConf={avg_conf:.4f} | "
-              f"CorrectConf={correct_conf:.4f} | IncorrectConf={incorrect_conf:.4f}")
-    
-    # Overall accuracy
-    macro_acc = accuracy_score(all_true_emo, all_pred_emo)
-    macro_f1 = f1_score(all_true_emo, all_pred_emo, average='macro', zero_division=0)
-    weighted_f1 = f1_score(all_true_emo, all_pred_emo, average='weighted', zero_division=0)
-    
-    print(f"\nOverall Accuracy:  {macro_acc:.4f}")
-    print(f"Macro F1-Score:    {macro_f1:.4f}")
-    print(f"Weighted F1-Score: {weighted_f1:.4f}")
-    
-    # Hidden flag metrics
-    print("\n" + "=" * 70)
-    print("HIDDEN FLAG DETECTION")
-    print("=" * 70)
-    
-    acc_hid = accuracy_score(all_true_hid, all_pred_hid)
-    prec_hid, rec_hid, f1_hid, _ = precision_recall_fscore_support(
-        all_true_hid,
-        all_pred_hid,
-        average="binary",
-        pos_label=1,
-        zero_division=0
+def get_scheduler_with_warm_restarts(optimizer, num_training_steps, num_warmup_steps=0.1, num_cycles=3):
+    return get_cosine_with_hard_restarts_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_warmup_steps * num_training_steps),
+        num_training_steps=num_training_steps,
+        num_cycles=num_cycles
     )
-    
-    print(f"Accuracy:  {acc_hid:.4f}")
-    print(f"Precision: {prec_hid:.4f}")
-    print(f"Recall:    {rec_hid:.4f}")
-    print(f"F1-Score:  {f1_hid:.4f}")
-    
-    # AUC for hidden flag
-    try:
-        hid_auc = roc_auc_score(all_true_hid, all_hid_probs)
-        print(f"AUC:       {hid_auc:.4f}")
-    except:
-        hid_auc = 0.0
-    
-    # Confusion matrix
-    cm_hid = confusion_matrix(all_true_hid, all_pred_hid)
-    print(f"\nConfusion Matrix:")
-    print(f"              Predicted")
-    print(f"              Neg    Pos")
-    print(f"Actual Neg    {cm_hid[0,0]:4d}  {cm_hid[0,1]:4d}")
-    print(f"       Pos    {cm_hid[1,0]:4d}  {cm_hid[1,1]:4d}")
-    
-    if criterion is not None and num_batches > 0:
-        avg_loss = total_loss / num_batches
-        print(f"\nValidation Loss: {avg_loss:.4f}")
-    
-    metrics = {
-        "emo_accuracy": macro_acc,
-        "emo_macro_f1": macro_f1,
-        "emo_weighted_f1": weighted_f1,
-        "hid_accuracy": acc_hid,
-        "hid_precision": prec_hid,
-        "hid_recall": rec_hid,
-        "hid_f1": f1_hid,
-        "hid_auc": hid_auc,
-        "avg_confidence": np.mean(all_confidences),
-        "class_metrics": class_metrics,
-        "emo_probs": all_emo_probs,
-        "predictions": all_pred_emo
-    }
-    
-    if criterion is not None:
-        metrics["loss"] = total_loss / max(num_batches, 1)
-    
-    return metrics
 
 # ============================================================================
-# IMPROVEMENT 5: Advanced Early Stopping with Plateau Detection
+# ADVANCED EARLY STOPPING
 # ============================================================================
 
 class AdvancedEarlyStopping:
-    """Advanced early stopping with plateau detection and model checkpointing"""
+    """Early stopping with plateau detection"""
     
-    def __init__(self, patience: int = 5, monitor: str = "val_emo_accuracy", 
-                 mode: str = "max", min_delta: float = 0.001, 
-                 plateau_patience: int = 3):
+    def __init__(self, patience: int = 5, monitor: str = "val_emo_accuracy",
+                 mode: str = "max", min_delta: float = 0.001, plateau_patience: int = 3):
         self.patience = patience
         self.plateau_patience = plateau_patience
         self.monitor = monitor
@@ -470,9 +913,6 @@ class AdvancedEarlyStopping:
         self.scores_history = []
     
     def __call__(self, score: float, model_state_dict: dict, epoch: int, lr: float = None) -> dict:
-        """
-        Returns: dict with 'stop' (bool) and 'reduce_lr' (bool)
-        """
         self.scores_history.append(score)
         
         if self.best_score is None:
@@ -497,8 +937,6 @@ class AdvancedEarlyStopping:
             return {'stop': False, 'reduce_lr': False}
         else:
             self.counter += 1
-            
-            # Detect plateau
             if plateau:
                 self.plateau_counter += 1
             else:
@@ -515,122 +953,47 @@ class AdvancedEarlyStopping:
             return {'stop': False, 'reduce_lr': reduce_lr}
 
 # ============================================================================
-# IMPROVEMENT 6: Label Smoothing with Confidence Penalty
+# CLASS WEIGHT CALCULATION
 # ============================================================================
 
-class ConfidencePenaltyLoss(nn.Module):
-    """Cross-entropy with label smoothing and confidence penalty"""
+def calculate_class_weights_advanced(emo_ids: list, method: str = "effective_num",
+                                     beta: float = 0.999, smooth: float = 1.0) -> dict:
+    emo_counts = Counter(emo_ids)
+    num_classes = len(emo_counts)
     
-    def __init__(self, num_classes, smoothing=0.1, confidence_penalty=0.1):
-        super().__init__()
-        self.num_classes = num_classes
-        self.smoothing = smoothing
-        self.confidence_penalty = confidence_penalty
+    for i in range(num_classes):
+        if i not in emo_counts:
+            emo_counts[i] = smooth
     
-    def forward(self, logits, targets):
-        # Label smoothing
-        smooth_targets = torch.zeros_like(logits).scatter_(
-            1, targets.unsqueeze(1), 1.0 - self.smoothing
-        )
-        smooth_targets += self.smoothing / self.num_classes
-        
-        # Cross-entropy
-        log_probs = F.log_softmax(logits, dim=-1)
-        ce_loss = -(smooth_targets * log_probs).sum(dim=-1).mean()
-        
-        # Confidence penalty (encourage diverse predictions)
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * log_probs).sum(dim=-1).mean()
-        confidence_penalty = -entropy * self.confidence_penalty
-        
-        return ce_loss + confidence_penalty
-
-# ============================================================================
-# IMPROVEMENT 7: Focal Loss with Adaptive Gamma
-# ============================================================================
-
-class AdaptiveFocalLoss(nn.Module):
-    """Focal loss with adaptive gamma based on class difficulty"""
+    if method == "effective_num":
+        effective_num = 1.0 - np.power(beta, list(emo_counts.values()))
+        weights = (1.0 - beta) / np.array(effective_num)
+        weights = weights / np.sum(weights) * num_classes
+        weights = np.sqrt(weights) * 2
+        class_weights = {i: float(w) for i, w in enumerate(weights)}
+    else:
+        total = sum(emo_counts.values())
+        class_weights = {i: total / (num_classes * count + 1) for i, count in emo_counts.items()}
     
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-    
-    def forward(self, logits, targets):
-        ce_loss = F.cross_entropy(logits, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        
-        # Adaptive gamma: increase for easy examples, decrease for hard ones
-        gamma_t = self.gamma * (1 + pt)  # Higher gamma for easy examples
-        
-        focal_weight = (1 - pt) ** gamma_t
-        
-        if self.alpha is not None:
-            alpha_weight = self.alpha[targets]
-            focal_weight = focal_weight * alpha_weight
-        
-        loss = focal_weight * ce_loss
-        
-        if self.reduction == 'mean':
-            loss = loss.mean()
-        elif self.reduction == 'sum':
-            loss = loss.sum()
-        
-        return loss
+    return class_weights
 
 # ============================================================================
-# IMPROVEMENT 8: Cosine Annealing with Warm Restarts
+# MAIN TRAINING FUNCTION
 # ============================================================================
 
-def get_scheduler_with_warm_restarts(optimizer, num_training_steps, num_warmup_steps=0.1, num_cycles=3):
-    """Cosine annealing with warm restarts"""
-    return get_cosine_with_hard_restarts_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(num_warmup_steps * num_training_steps),
-        num_training_steps=num_training_steps,
-        num_cycles=num_cycles
-    )
-
-# ============================================================================
-# Collate Function
-# ============================================================================
-
-def collate_fn(batch, tokenizer, max_length: int = 128):
+def train_model_advanced(config: dict, train_data: dict, val_data: dict,
+                         label_encoder_27, label_encoder_6, device: str):
     """
-    Collate function used by DataLoader workers.
-    Takes a batch of (text, emotion_id, hidden_id) and tokenizes it.
-    """
-    texts, emo_ids, hid_ids = zip(*batch)
-    enc = tokenizer(
-        list(texts),
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    enc["emotion_labels"] = torch.tensor(emo_ids, dtype=torch.long)
-    enc["hidden_labels"] = torch.tensor(hid_ids, dtype=torch.float)
-    return enc
-
-# ============================================================================
-# MAIN TRAINING FUNCTION WITH ALL IMPROVEMENTS (FIXED dtype issues)
-# ============================================================================
-
-def train_model_advanced(config: dict, train_data: dict, val_data: dict, label_encoder, device: str):
-    """
-    Main training function with all accuracy improvements
+    Main training function with 3-task learning
     """
     train_cfg = config['training']
     model_cfg = config['model']
     tokenizer_cfg = config.get('tokenizer', {"max_length": 128})
     
-    # Mixed precision training - DISABLED to avoid dtype issues
     use_amp = False
     scaler = None
     
-    # Load model/tokenizer with cache
+    # Load model/tokenizer
     model_path = get_pretrained_model_path(model_cfg['base_model_name'])
     tokenizer_path = get_pretrained_tokenizer_path(model_cfg['base_model_name'])
     
@@ -642,55 +1005,48 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict, label_e
     )
     logger.info(f"Tokenizer vocab size: {tokenizer.vocab_size}")
     
-    # Add special tokens if needed
+    # Add special tokens
     special_tokens = ['[EMOJI=', '[CONFLICT_POS_EMOJI_NEG_TEXT]', '[CONFLICT_NEG_EMOJI_POS_TEXT]',
                       '[SMILE_EMOJI]', '[HEART_EMOJI]', '[CRY_EMOJI]', '[ANGRY_EMOJI]', '[LONG_TEXT]', ']']
     
-    # Check if tokens exist, add if not
-    new_tokens = []
-    for token in special_tokens:
-        if token not in tokenizer.vocab:
-            new_tokens.append(token)
-    
+    new_tokens = [t for t in special_tokens if t not in tokenizer.vocab]
     if new_tokens:
         tokenizer.add_tokens(new_tokens)
-        logger.info(f"Added {len(new_tokens)} special tokens to tokenizer")
+        logger.info(f"Added {len(new_tokens)} special tokens")
     
-    # Create datasets with advanced augmentation
+    # Create datasets with 3 labels
     train_ds = EmotionHiddenDataset(
         texts=train_data['texts'],
-        emo_ids=train_data['emo_ids'],
-        hid_ids=train_data['hid_ids'],
+        emo_ids=train_data['emo_ids'],           # 27-class
+        hid_ids=train_data['hid_ids'],           # binary flag
+        hidden6_ids=train_data['hidden6_ids'],   # 6-class (NEW)
         emojis=train_data['emojis'],
         augment=True,
-        minority_classes=[3, 4, 5]  # fear, love, surprise
+        minority_classes=[3, 4, 5]
     )
     
     val_ds = EmotionHiddenDataset(
         texts=val_data['texts'],
         emo_ids=val_data['emo_ids'],
         hid_ids=val_data['hid_ids'],
+        hidden6_ids=val_data['hidden6_ids'],     # 6-class (NEW)
         emojis=val_data['emojis'],
         augment=False
     )
     
-    # Calculate class weights with improved method
+    # Class weights for 27-class
     class_weights = calculate_class_weights_advanced(
         train_data['emo_ids'],
         method="effective_num",
         beta=0.999
     )
-    logger.info(f"Class weights: {class_weights}")
+    logger.info(f"27-class weights: {class_weights}")
     
-    # Create weighted sampler with replacement
+    # Weighted sampler
     sample_weights = [class_weights.get(c, 1.0) for c in train_data['emo_ids']]
-    sampler = WeightedRandomSampler(
-        sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
     
-    # Create dataloaders with improved collation
+    # DataLoaders
     _collate = partial(collate_fn, tokenizer=tokenizer, max_length=tokenizer_cfg['max_length'])
     
     train_loader = DataLoader(
@@ -711,58 +1067,56 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict, label_e
         pin_memory=True if device.type == "cuda" else False,
     )
     
-    # Initialize model
+    # Initialize model with 3 tasks
     model = EnhancedEmotionHiddenModel(
         base_model_name=model_cfg['base_model_name'],
-        num_emotions=model_cfg['num_emotions'],
+        num_emotions=model_cfg['num_emotions'],  # 27
+        num_hidden6=6,                           # 6-class
         dropout_p=model_cfg['dropout'],
         local_model_path=model_path,
         use_gradient_checkpointing=train_cfg.get('gradient_checkpointing', False),
         hidden_size_factor=train_cfg.get('hidden_size_factor', 2)
     )
     
-    # Resize token embeddings if we added new tokens
+    # Resize embeddings if new tokens added
     if new_tokens:
         model.encoder.resize_token_embeddings(len(tokenizer))
         logger.info("Resized token embeddings")
     
-    # Move to device and ensure consistent dtype (float32)
-    model = model.to(device)
-    model = model.float()
-    
+    model = model.to(device).float()
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Selective layer freezing (keep more layers trainable)
+    # Freeze layers
     freeze_layers = model_cfg.get('freeze_layers', 1)
     for name, param in model.named_parameters():
         if "encoder.embeddings" in name or any(f"encoder.encoder.layer.{i}" in name for i in range(freeze_layers)):
             param.requires_grad = False
     
-    # Count trainable parameters
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    logger.info(f"Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
     
-    # Initialize loss function with improvements
+    # Loss function with 3 tasks
     loss_cfg = train_cfg['loss']
     criterion = EnhancedMultitaskLoss(
         class_weights_dict=class_weights,
         gamma=loss_cfg['focal_gamma'],
-        hidden_weight=loss_cfg['hidden_weight'],
+        hidden_weight=loss_cfg['hidden_weight'],      # binary flag weight
+        hidden6_weight=0.6,                            # 6-class weight
         pos_weight=loss_cfg['pos_weight'],
         label_smoothing=loss_cfg['label_smoothing'],
         device=str(device),
         use_uncertainty_weighting=True
     )
     
-    # Setup optimizer with layer-wise learning rate decay
+    # Optimizer with LLRD
     optimizer = get_optimizer_with_llrd(
         model,
         base_lr=float(train_cfg['learning_rate_encoder']),
         decay_factor=0.95
     )
     
-    # Setup scheduler with warm restarts
+    # Scheduler
     num_training_steps = int(train_cfg['num_epochs'] * len(train_loader))
     scheduler = get_scheduler_with_warm_restarts(
         optimizer,
@@ -771,13 +1125,7 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict, label_e
         num_cycles=3
     )
     
-    # Stochastic Weight Averaging - disabled by default
-    use_swa = False
-    swa_model = None
-    swa_scheduler = None
-    swa_start = 0
-    
-    # Advanced early stopping
+    # Early stopping
     early_stopping = AdvancedEarlyStopping(
         patience=train_cfg['early_stopping']['patience'],
         monitor=train_cfg['early_stopping']['monitor'],
@@ -788,495 +1136,266 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict, label_e
     
     # Training loop
     logger.info("\n" + "=" * 70)
-    logger.info("STARTING TRAINING WITH ADVANCED FEATURES")
+    logger.info("STARTING 3-TASK TRAINING")
     logger.info("=" * 70)
     
     best_val_acc = 0.0
     best_epoch = 0
-    gradient_accumulation_steps = train_cfg.get('gradient_accumulation_steps', 1)
+    grad_accum = train_cfg.get('gradient_accumulation_steps', 1)
     
     for epoch in range(train_cfg['num_epochs']):
         logger.info(f"\n{'='*50}")
         logger.info(f"EPOCH {epoch + 1}/{train_cfg['num_epochs']}")
         logger.info(f"{'='*50}")
         
-        # Training phase
+        # Training
         model.train()
         train_loss = 0
-        emo_correct = 0
-        hid_correct = 0
+        emo_correct = hid_correct = h6_correct = 0
         total_samples = 0
         optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(train_loader):
-            # Move batch to device with correct dtypes
+            # Move to device
             input_ids = batch["input_ids"].to(device).long()
             attention_mask = batch["attention_mask"].to(device).float()
             emotion_labels = batch["emotion_labels"].to(device).long()
             hidden_labels = batch["hidden_labels"].to(device).float()
+            hidden6_labels = batch["hidden6_labels"].to(device).long()
             
-            # Forward pass
-            emo_logits, hid_logits = model(
+            # Forward
+            emo_logits, hid_logits, hidden6_logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask
             )
             
-            loss, l_emo, l_hid = criterion(
+            loss, l_emo, l_hid, l_hid6 = criterion(
                 emo_logits, emotion_labels,
-                hid_logits, hidden_labels
+                hid_logits, hidden_labels,
+                hidden6_logits, hidden6_labels
             )
             
-            # Scale loss for gradient accumulation
-            loss = loss / gradient_accumulation_steps
+            loss = loss / grad_accum
             
-            # Skip if loss is NaN
             if torch.isnan(loss) or torch.isinf(loss):
-                logger.warning(f"NaN/Inf loss at batch {batch_idx + 1}, skipping")
+                logger.warning(f"NaN/Inf loss at batch {batch_idx + 1}")
                 continue
             
-            # Backward pass
             loss.backward()
             
-            # Gradient accumulation
-            if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                # Gradient clipping
+            if (batch_idx + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=train_cfg['max_grad_norm'])
-                
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
             
-            # Calculate batch accuracy
+            # Accuracy
             emo_preds = emo_logits.argmax(dim=-1)
             hid_preds = (torch.sigmoid(hid_logits) > 0.5).long()
+            h6_preds = hidden6_logits.argmax(dim=-1)
             
             emo_correct += (emo_preds == emotion_labels).sum().item()
             hid_correct += (hid_preds == hidden_labels.long()).sum().item()
+            h6_correct += (h6_preds == hidden6_labels).sum().item()
             total_samples += len(emotion_labels)
-            train_loss += loss.item() * gradient_accumulation_steps
+            train_loss += loss.item() * grad_accum
             
             if (batch_idx + 1) % 50 == 0:
-                if total_samples > 0:
-                    logger.info(f"  Batch {batch_idx + 1}/{len(train_loader)} | "
-                              f"Loss: {loss.item()*gradient_accumulation_steps:.4f} | "
-                              f"Emo Acc: {emo_correct/total_samples:.4f} | "
-                              f"Hid Acc: {hid_correct/total_samples:.4f}")
+                logger.info(f"  Batch {batch_idx + 1}/{len(train_loader)} | "
+                          f"Loss: {loss.item()*grad_accum:.4f} | "
+                          f"Emo: {emo_correct/total_samples:.3f} | "
+                          f"Hid: {hid_correct/total_samples:.3f} | "
+                          f"H6: {h6_correct/total_samples:.3f}")
         
-        # Calculate epoch metrics
-        avg_train_loss = train_loss / len(train_loader)
-        train_emo_acc = emo_correct / total_samples if total_samples > 0 else 0.0
-        train_hid_acc = hid_correct / total_samples if total_samples > 0 else 0.0
+        # Epoch metrics
+        avg_loss = train_loss / len(train_loader)
+        train_emo_acc = emo_correct / total_samples
+        train_hid_acc = hid_correct / total_samples
+        train_h6_acc = h6_correct / total_samples
         
         logger.info(f"\nTraining Summary:")
-        logger.info(f"  Avg Loss: {avg_train_loss:.4f}")
-        logger.info(f"  Emotion Accuracy: {train_emo_acc:.4f}")
-        logger.info(f"  Hidden Accuracy: {train_hid_acc:.4f}")
-        logger.info(f"  Current LR: {optimizer.param_groups[-1]['lr']:.2e}")
+        logger.info(f"  Loss: {avg_loss:.4f} | Emo: {train_emo_acc:.4f} | "
+                   f"Hid: {train_hid_acc:.4f} | H6: {train_h6_acc:.4f}")
         
         if mlflow.active_run():
             mlflow.log_metrics({
-                "train_loss": avg_train_loss,
+                "train_loss": avg_loss,
                 "train_emo_accuracy": train_emo_acc,
                 "train_hid_accuracy": train_hid_acc,
-                "learning_rate": optimizer.param_groups[-1]['lr']
+                "train_h6_accuracy": train_h6_acc,
             }, step=epoch + 1)
         
-        # Validation phase with advanced metrics
+        # Validation
         logger.info(f"\nValidation Results:")
-        val_metrics = evaluate_model_advanced(model, val_loader, criterion, device, use_amp=False)
+        val_metrics = evaluate_model_advanced(model, val_loader, criterion, device)
         
-        # Log validation metrics
         if mlflow.active_run():
             mlflow.log_metrics({
                 "val_emo_accuracy": val_metrics["emo_accuracy"],
                 "val_emo_macro_f1": val_metrics["emo_macro_f1"],
                 "val_hid_accuracy": val_metrics["hid_accuracy"],
                 "val_hid_f1": val_metrics["hid_f1"],
-                "val_hid_auc": val_metrics["hid_auc"],
-                "val_loss": val_metrics.get("loss", 0.0)
+                "val_hidden6_accuracy": val_metrics["hidden6_accuracy"],
+                "val_hidden6_macro_f1": val_metrics["hidden6_macro_f1"],
             }, step=epoch + 1)
         
-        # Early stopping check
-        monitor_metric = val_metrics.get(train_cfg['early_stopping']['monitor'], 
-                                        val_metrics['emo_accuracy'])
+        # Early stopping
+        monitor_metric = val_metrics.get(train_cfg['early_stopping']['monitor'], val_metrics['emo_accuracy'])
+        result = early_stopping(monitor_metric, model.state_dict(), epoch)
         
-        early_stop_result = early_stopping(
-            monitor_metric, 
-            model.state_dict(), 
-            epoch,
-            optimizer.param_groups[-1]['lr'] if optimizer.param_groups else None
-        )
+        if result['reduce_lr']:
+            for pg in optimizer.param_groups:
+                pg['lr'] *= 0.5
         
-        # Reduce learning rate on plateau
-        if early_stop_result['reduce_lr']:
-            logger.info(f"  ⚠️ Plateau detected, reducing learning rate")
-            for param_group in optimizer.param_groups:
-                param_group['lr'] *= 0.5
-        
-        if early_stop_result['stop']:
-            logger.info(f"Loading best model from epoch {early_stopping.best_epoch + 1}")
+        if result['stop']:
             model.load_state_dict(early_stopping.best_model_state)
             break
         
-        # Save best model
+        # Save best
         if val_metrics['emo_accuracy'] > best_val_acc:
             best_val_acc = val_metrics['emo_accuracy']
             best_epoch = epoch
-            data_paths = get_data_paths()
-            model_dir = os.path.join(os.path.dirname(__file__), '..', data_paths['model_artifacts_dir'])
-            os.makedirs(model_dir, exist_ok=True)
-            model_path = os.path.join(model_dir, 'best_emotion_model.pt')
-            
-            # Save with metadata
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'label_encoder': label_encoder,
-                'class_names': list(label_encoder.classes_),
+                'label_encoder_27': label_encoder_27,
+                'label_encoder_6': label_encoder_6,
+                'class_names_27': list(label_encoder_27.classes_),
+                'class_names_6': list(label_encoder_6.classes_),
                 'tokenizer': tokenizer,
                 'config': config,
                 'val_metrics': val_metrics,
-                'best_val_acc': best_val_acc
-            }, model_path)
+            }, "best_3task_model.pt")
             logger.info(f"  ✓ New best model saved! (Acc: {best_val_acc:.4f})")
     
-    # Load best model
+    # Final evaluation
     if early_stopping.best_model_state is not None:
         model.load_state_dict(early_stopping.best_model_state)
-        logger.info(f"\nLoaded best model from epoch {early_stopping.best_epoch + 1} with accuracy: {best_val_acc:.4f}")
     
-    # Final evaluation
     logger.info("\n" + "=" * 70)
-    logger.info("FINAL EVALUATION ON BEST MODEL")
+    logger.info("FINAL EVALUATION")
     logger.info("=" * 70)
-    final_metrics = evaluate_model_advanced(model, val_loader, criterion, device, use_amp=False)
+    final_metrics = evaluate_model_advanced(model, val_loader, criterion, device)
     
     return model, final_metrics, tokenizer
 
 # ============================================================================
-# HELPER FUNCTION: Advanced Class Weight Calculation
-# ============================================================================
-
-def calculate_class_weights_advanced(emo_ids: list, method: str = "effective_num", 
-                                     beta: float = 0.999, smooth: float = 1.0) -> dict:
-    """
-    Calculate class weights with advanced smoothing techniques
-    """
-    emo_counts = Counter(emo_ids)
-    num_classes = len(emo_counts)
-    
-    # Add smoothing for missing classes
-    for i in range(num_classes):
-        if i not in emo_counts:
-            emo_counts[i] = smooth
-    
-    if method == "effective_num":
-        # Effective number of samples
-        effective_num = 1.0 - np.power(beta, list(emo_counts.values()))
-        weights = (1.0 - beta) / np.array(effective_num)
-        weights = weights / np.sum(weights) * num_classes
-        
-        # Apply square root scaling to prevent extreme weights
-        weights = np.sqrt(weights) * 2
-        
-        class_weights = {i: float(w) for i, w in enumerate(weights)}
-    
-    elif method == "inverse_sqrt":
-        # Inverse square root frequency
-        total = sum(emo_counts.values())
-        weights = [np.sqrt(total / (count)) for count in emo_counts.values()]
-        weights = [w / sum(weights) * num_classes for w in weights]
-        class_weights = {i: float(w) for i, w in enumerate(weights)}
-    
-    else:  # inverse_freq with smoothing
-        total = sum(emo_counts.values())
-        class_weights = {i: total / (num_classes * count + 1) for i, count in emo_counts.items()}
-    
-    return class_weights
-
-# ============================================================================
-# MAIN PIPELINE FUNCTION
+# MAIN PIPELINE
 # ============================================================================
 
 def emotion_train_pipeline(data_path: str = None, dataset_name: str = None):
     """
-    Main training pipeline entry point with all improvements
+    Main training pipeline for 3-task emotion detection
     """
-    # Load configuration
     config = load_config()
     
-    # Override config from environment variables
-    import os
+    # Override from env
     if 'OVERRIDE_EPOCHS' in os.environ:
         config['training']['num_epochs'] = int(os.environ['OVERRIDE_EPOCHS'])
-    if 'OVERRIDE_BATCH_SIZE' in os.environ:
-        config['training']['batch_size'] = int(os.environ['OVERRIDE_BATCH_SIZE'])
-    if 'OVERRIDE_EXPERIMENT' in os.environ:
-        config['mlflow']['experiment_name'] = os.environ['OVERRIDE_EXPERIMENT']
     
     data_paths = get_data_paths()
     
-    # Determine dataset path
+    # Dataset path
     if data_path:
         dataset_path = data_path
-        logger.info(f"Using provided dataset path: {dataset_path}")
     elif dataset_name:
         datasets = data_paths.get('datasets', {})
         if dataset_name in datasets:
             dataset_path = datasets[dataset_name]
-            logger.info(f"Using dataset '{dataset_name}': {dataset_path}")
         else:
-            available = list(datasets.keys())
-            raise ValueError(f"Dataset '{dataset_name}' not found. Available: {available}")
+            raise ValueError(f"Dataset '{dataset_name}' not found")
     else:
         dataset_path = data_paths.get('raw_data', 'merged_full_dataset.csv')
-        logger.info(f"Using default dataset: {dataset_path}")
     
-    # Setup device
+    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
     if device.type == "cuda":
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        
-        # Enable TF32 for better performance on Ampere GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
-    # Initialize MLflow
+    # MLflow
     if config.get('mlflow', {}).get('tracking_enabled', True):
-        experiment_name = config['mlflow']['experiment_name']
-        if dataset_name:
-            experiment_name = f"{experiment_name}_{dataset_name}"
         init_mlflow(
             tracking_uri=data_paths.get('mlflow_tracking_uri'),
-            experiment_name=experiment_name
+            experiment_name=config['mlflow']['experiment_name']
         )
     
-    # Load and preprocess data
-    train_data, val_data, label_encoder = emotion_data_pipeline(data_path=dataset_path)
+    # Load data - Modified to return 6-class encoder as well
+    # Assuming emotion_data_pipeline now returns (train, val, le_27, le_6)
+    train_data, val_data, label_encoder_27, label_encoder_6 = emotion_data_pipeline(data_path=dataset_path)
     
-    # Start MLflow run
     with mlflow.start_run():
-        # Log hyperparameters
         mlflow.log_params({
             "model_name": config['model']['base_model_name'],
             "num_epochs": config['training']['num_epochs'],
             "batch_size": config['training']['batch_size'],
             "lr_encoder": config['training']['learning_rate_encoder'],
-            "lr_head": config['training']['learning_rate_head'],
             "max_length": 128,
-            "dataset_path": dataset_path,
-            "dataset_name": dataset_name or "default",
             "focal_gamma": config['training']['loss']['focal_gamma'],
             "label_smoothing": config['training']['loss']['label_smoothing'],
             "hidden_weight": config['training']['loss']['hidden_weight'],
-            "pos_weight": config['training']['loss']['pos_weight'],
+            "hidden6_weight": 0.6,
             "scheduler_type": "cosine_with_restarts",
             "mixed_precision": False,
-            "gradient_accumulation_steps": config['training'].get('gradient_accumulation_steps', 1),
             "layerwise_lr_decay": 0.95,
             "augmentation": "advanced",
-            "weight_method": "effective_num_with_sqrt"
+            "tasks": "27class + binary_flag + 6class_hidden"
         })
         
-        # Train model with advanced features
-        model, metrics, tokenizer = train_model_advanced(config, train_data, val_data, label_encoder, device)
+        # Train
+        model, metrics, tokenizer = train_model_advanced(
+            config, train_data, val_data,
+            label_encoder_27, label_encoder_6, device
+        )
         
         # Log final metrics
-        for key, value in metrics.items():
-            if isinstance(value, (int, float)) and key not in ['emo_probs', 'predictions', 'class_metrics']:
-                mlflow.log_metric(f"final_{key}", value)
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)) and k not in ['emo_probs', 'predictions', 'hidden6_probs']:
+                mlflow.log_metric(f"final_{k}", v)
         
-        # Save final model
+        # Save
         torch.save({
             'model_state_dict': model.state_dict(),
-            'label_encoder': label_encoder,
-            'class_names': list(label_encoder.classes_),
+            'label_encoder_27': label_encoder_27,
+            'label_encoder_6': label_encoder_6,
+            'class_names_27': list(label_encoder_27.classes_),
+            'class_names_6': list(label_encoder_6.classes_),
             'tokenizer': tokenizer,
             'config': config,
             'final_metrics': {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
-        }, "final_emotion_hidden_model_advanced.pt")
-        logger.info("\nModel saved as 'final_emotion_hidden_model_advanced.pt'")
+        }, "final_3task_model.pt")
+        logger.info("\nModel saved as 'final_3task_model.pt'")
         
         # Log artifacts
-        if config.get('mlflow', {}).get('log_artifacts', True):
-            log_pytorch_model(model, artifact_path="model")
-            log_label_encoder(label_encoder)
-            log_training_config({
-                "class_names": list(label_encoder.classes_),
-                "model_config": config['model'],
-                "training_config": config['training'],
-                "final_metrics": {k: v for k, v in metrics.items() if isinstance(v, (int, float))},
-                "per_class_metrics": metrics.get('class_metrics', {})
-            })
+        log_pytorch_model(model, artifact_path="model")
+        log_label_encoder(label_encoder_27, "label_encoder_27")
+        log_label_encoder(label_encoder_6, "label_encoder_6")
     
-    logger.info("\n" + "=" * 70)
-    logger.info("TRAINING COMPLETE")
-    logger.info("=" * 70)
     return model, metrics, tokenizer
-
-
-# ============================================================================
-# PREDICTION FUNCTION
-# ============================================================================
-
-def predict_emotion_advanced(text, emoji_char="", model=None, tokenizer=None, le=None, device="cuda"):
-    """
-    Advanced prediction function with confidence calibration
-    """
-    if model is None:
-        # Load saved model
-        checkpoint = torch.load("final_emotion_hidden_model_advanced.pt", map_location=device)
-        model = EnhancedEmotionHiddenModel(
-            "microsoft/deberta-v3-base", 
-            len(checkpoint['class_names']),
-            dropout_p=0.3
-        ).to(device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        le = checkpoint['label_encoder']
-        tokenizer = checkpoint['tokenizer']
-    
-    model.eval()
-    
-    # Preprocess using shared function
-    proc_text = build_input(text, emoji_char)
-    
-    # Tokenize
-    enc = tokenizer(
-        proc_text,
-        padding=True,
-        truncation=True,
-        max_length=128,
-        return_tensors="pt",
-    )
-    
-    input_ids = enc["input_ids"].to(device).long()
-    attention_mask = enc["attention_mask"].to(device).float()
-    
-    with torch.no_grad():
-        emo_logits, hid_logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        
-        # Apply temperature scaling for better calibration
-        emo_probs = torch.softmax(emo_logits / 1.5, dim=-1)[0]
-        hid_prob = torch.sigmoid(hid_logits)[0].item()
-        
-        # Get predictions
-        emo_id = torch.argmax(emo_probs).item()
-        emo_label = le.inverse_transform([emo_id])[0]
-        emo_confidence = emo_probs[emo_id].item()
-        
-        # Get top-3 predictions
-        top_probs, top_indices = torch.topk(emo_probs, min(3, len(emo_probs)))
-        top_emotions = le.inverse_transform(top_indices.cpu().numpy())
-        top_confidences = top_probs.cpu().numpy()
-        
-        # Calculate entropy for uncertainty
-        entropy = -(emo_probs * torch.log(emo_probs + 1e-9)).sum().item()
-        normalized_entropy = entropy / np.log(len(le.classes_))
-        
-        # Calculate margin
-        if len(emo_probs) > 1:
-            sorted_probs = torch.sort(emo_probs, descending=True)[0]
-            margin = (sorted_probs[0] - sorted_probs[1]).item()
-        else:
-            margin = 1.0
-    
-    result = {
-        "predicted_emotion": emo_label,
-        "emotion_confidence": emo_confidence,
-        "hidden_probability": hid_prob,
-        "is_hidden": hid_prob > 0.5,
-        "uncertainty": normalized_entropy,
-        "margin": margin,
-        "top_predictions": [
-            {"emotion": e, "confidence": float(c)}
-            for e, c in zip(top_emotions, top_confidences)
-        ],
-        "processed_text": proc_text,
-        "all_probabilities": {
-            le.inverse_transform([i])[0]: float(emo_probs[i])
-            for i in range(len(emo_probs))
-        }
-    }
-    
-    return result
 
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description='Train advanced emotion detection model',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    parser.add_argument(
-        '--data-path', '--data_path',
-        type=str,
-        default=None,
-        help='Direct path to dataset CSV file'
-    )
-    
-    parser.add_argument(
-        '--dataset', '--dataset-name',
-        type=str,
-        default=None,
-        dest='dataset_name',
-        help='Name of dataset from config.yaml datasets section'
-    )
-    
-    parser.add_argument(
-        '--epochs', '--num-epochs',
-        type=int,
-        default=None,
-        dest='num_epochs',
-        help='Override number of epochs'
-    )
-    
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=None,
-        help='Override batch size'
-    )
-    
-    parser.add_argument(
-        '--list-datasets', '--list_datasets',
-        action='store_true',
-        help='List available datasets from config.yaml and exit'
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data-path', type=str, default=None)
+    parser.add_argument('--dataset', type=str, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--list-datasets', action='store_true')
     args = parser.parse_args()
     
-    # Override config from command line
-    if args.num_epochs:
-        os.environ['OVERRIDE_EPOCHS'] = str(args.num_epochs)
-    if args.batch_size:
-        os.environ['OVERRIDE_BATCH_SIZE'] = str(args.batch_size)
+    if args.epochs:
+        os.environ['OVERRIDE_EPOCHS'] = str(args.epochs)
     
-    # List datasets if requested
     if args.list_datasets:
         config = load_config()
         data_paths = get_data_paths()
         datasets = data_paths.get('datasets', {})
-        print("\nAvailable datasets in config.yaml:")
-        print("=" * 60)
+        print("\nAvailable datasets:")
         for name, path in datasets.items():
             print(f"  {name:20s} -> {path}")
-        print("=" * 60)
-        print(f"\nDefault dataset: {data_paths.get('raw_data', 'N/A')}")
         exit(0)
     
-    # Validate arguments
-    if args.data_path and args.dataset_name:
-        logger.warning("Both --data-path and --dataset provided. Using --data-path.")
-        args.dataset_name = None
-    
-    # Run training
-    emotion_train_pipeline(data_path=args.data_path, dataset_name=args.dataset_name)
+    emotion_train_pipeline(data_path=args.data_path, dataset_name=args.dataset)
