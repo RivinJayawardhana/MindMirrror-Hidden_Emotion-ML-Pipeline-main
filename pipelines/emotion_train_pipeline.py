@@ -1,6 +1,6 @@
 """
 Training pipeline with transformer fine-tuning for multi-task emotion detection.
-Tasks: 27-class emotion | binary hidden flag | 6-class hidden emotion
+Tasks: binary hidden flag | 6-class hidden emotion
 """
 import os
 import sys
@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from utils.config import load_config, get_data_paths
 from utils.model_loader import get_pretrained_model_path, get_pretrained_tokenizer_path
 from utils.mlflow_utils import init_mlflow, log_pytorch_model, log_label_encoder, log_training_config
-from src.preprocessing import EmotionHiddenDataset, build_input
+from src.preprocessing import build_input
 import mlflow
 from pipelines.emotion_data_pipeline import emotion_data_pipeline
 
@@ -123,30 +123,28 @@ class MixUp:
     def __init__(self, alpha=0.2):
         self.alpha = alpha
     
-    def mixup(self, x1, x2, y1, y2, y3_1, y3_2):
-        """Apply mixup to two samples (3 tasks)"""
+    def mixup(self, x1, x2, y1, y2):
+        """Apply mixup to two samples (2 tasks)"""
         lam = np.random.beta(self.alpha, self.alpha)
         
         mixed_x = lam * x1 + (1 - lam) * x2
-        mixed_y1 = lam * y1 + (1 - lam) * y2  # 27-class
-        mixed_y2 = lam * y3_1 + (1 - lam) * y3_2  # hidden flag
-        mixed_y3 = lam * y3_1 + (1 - lam) * y3_2  # 6-class hidden
+        mixed_y1 = lam * y1 + (1 - lam) * y2  # hidden flag
+        mixed_y2 = lam * y1 + (1 - lam) * y2  # 6-class hidden
         
-        return mixed_x, mixed_y1, mixed_y2, mixed_y3, lam
+        return mixed_x, mixed_y1, mixed_y2, lam
 
 # ============================================================================
-# 1. MODEL UPGRADE - WITH 3 TASKS AND EMOJI EMBEDDING FUSION
+# 1. MODEL UPGRADE - 2 TASKS WITH EMOJI EMBEDDING FUSION
 # ============================================================================
 
 class EnhancedEmotionHiddenModel(nn.Module):
     """
     Multi-task transformer model for:
-    1. 27-class emotion classification
-    2. Binary hidden emotion flag detection
-    3. 6-class hidden emotion classification
+    1. Binary hidden emotion flag detection
+    2. 6-class hidden emotion classification
     """
     
-    def __init__(self, base_model_name: str, num_emotions: int = 27, num_hidden6: int = 6,
+    def __init__(self, base_model_name: str, num_hidden6: int = 6,
                  dropout_p: float = 0.3, local_model_path: str = None,
                  use_gradient_checkpointing: bool = False, hidden_size_factor: int = 2):
         super().__init__()
@@ -186,18 +184,7 @@ class EnhancedEmotionHiddenModel(nn.Module):
             nn.Dropout(dropout_p / 2)
         )
         
-        # 27-class emotion head
-        self.emotion_head = nn.Sequential(
-            nn.Linear(hidden_size, expanded_size),
-            nn.LayerNorm(expanded_size),
-            nn.GELU(),
-            nn.Dropout(dropout_p),
-            nn.Linear(expanded_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout_p / 2),
-            nn.Linear(hidden_size, num_emotions),
-        )
+        # REMOVED: 27-class emotion head
         
         # Hidden flag head (binary)
         self.hidden_head = nn.Sequential(
@@ -211,7 +198,7 @@ class EnhancedEmotionHiddenModel(nn.Module):
             nn.Linear(64, 1),
         )
         
-        # 6-class hidden emotion head (NEW)
+        # 6-class hidden emotion head
         self.hidden6_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.LayerNorm(hidden_size // 2),
@@ -229,7 +216,7 @@ class EnhancedEmotionHiddenModel(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        for module in [self.emotion_head, self.hidden_head, self.hidden6_head,
+        for module in [self.hidden_head, self.hidden6_head,
                        self.shared_projection, self.attention_pooling]:
             for layer in module:
                 if isinstance(layer, nn.Linear):
@@ -249,6 +236,9 @@ class EnhancedEmotionHiddenModel(nn.Module):
             input_ids: Tokenized input IDs [batch_size, seq_len]
             attention_mask: Attention mask [batch_size, seq_len]
             emoji_emotion_ids: 6-class emotion IDs for emoji [batch_size] (optional)
+        Returns:
+            hid_logits: Binary hidden flag logits [batch_size]
+            hidden6_logits: 6-class hidden emotion logits [batch_size, 6]
         """
         # Get encoder outputs
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -283,11 +273,10 @@ class EnhancedEmotionHiddenModel(nn.Module):
         shared_features = shared_features + pooled  # Residual on original pooled
         
         # Separate heads with temperature scaling
-        emo_logits = self.emotion_head(shared_features) / self.temperature
         hid_logits = self.hidden_head(shared_features).squeeze(-1)
-        hidden6_logits = self.hidden6_head(shared_features)  # NEW: 6-class logits
+        hidden6_logits = self.hidden6_head(shared_features)
         
-        return emo_logits, hid_logits, hidden6_logits
+        return hid_logits, hidden6_logits
     
     def freeze_encoder_layers(self, num_layers: int = 2):
         """Freeze first N layers of the encoder"""
@@ -307,7 +296,7 @@ class EnhancedEmotionHiddenModel(nn.Module):
         logger.info(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
 # ============================================================================
-# 2. LOSS UPGRADE - 3 TASKS WITH UNCERTAINTY WEIGHTING
+# 2. LOSS UPGRADE - 2 TASKS WITH UNCERTAINTY WEIGHTING
 # ============================================================================
 
 class FocalLoss(nn.Module):
@@ -363,35 +352,18 @@ class FocalLoss(nn.Module):
 
 class EnhancedMultitaskLoss(nn.Module):
     """
-    Multi-task loss with uncertainty weighting for 3 tasks:
-    1. 27-class emotion classification
-    2. Binary hidden flag detection
-    3. 6-class hidden emotion classification
+    Multi-task loss with uncertainty weighting for 2 tasks:
+    1. Binary hidden flag detection
+    2. 6-class hidden emotion classification
     """
     
-    def __init__(self, class_weights_dict: dict, gamma: float = 2.0,
-                 hidden_weight: float = 0.8, hidden6_weight: float = 0.6,
+    def __init__(self, gamma: float = 2.0, hidden_weight: float = 0.8,
                  pos_weight: float = 2.0, label_smoothing: float = 0.1,
                  device: str = "cuda", use_uncertainty_weighting: bool = True):
         super().__init__()
         
         # Task weights (can be used if uncertainty weighting is disabled)
         self.hidden_weight = hidden_weight
-        self.hidden6_weight = hidden6_weight
-        
-        # 27-class emotion loss
-        num_classes = len(class_weights_dict)
-        alpha_tensor = torch.zeros(num_classes)
-        for idx, weight in class_weights_dict.items():
-            alpha_tensor[idx] = weight
-        alpha_tensor = alpha_tensor / alpha_tensor.sum() * num_classes
-        alpha_tensor = alpha_tensor.to(device)
-        
-        self.emo_loss = FocalLoss(
-            alpha=alpha_tensor,
-            gamma=gamma,
-            label_smoothing=label_smoothing
-        )
         
         # Binary hidden flag loss
         self.hid_loss = nn.BCEWithLogitsLoss(
@@ -400,34 +372,28 @@ class EnhancedMultitaskLoss(nn.Module):
         
         # 6-class hidden emotion loss
         self.hidden6_loss = FocalLoss(
-            alpha=None,  # Can add class weights for 6-class if needed
+            alpha=None,
             gamma=gamma,
             label_smoothing=label_smoothing
         )
         
         self.use_uncertainty_weighting = use_uncertainty_weighting
         
-        # Learnable task uncertainty (log variance) for 3 tasks
+        # Learnable task uncertainty (log variance) for 2 tasks
         if use_uncertainty_weighting:
-            self.log_emotion_var = nn.Parameter(torch.zeros(1, device=device))
             self.log_hidden_var = nn.Parameter(torch.zeros(1, device=device))
             self.log_hidden6_var = nn.Parameter(torch.zeros(1, device=device))
     
-    def forward(self, emo_logits, emo_targets, hid_logits, hid_targets,
-                hidden6_logits, hidden6_targets):
+    def forward(self, hid_logits, hid_targets, hidden6_logits, hidden6_targets):
         """
         Compute multi-task loss with optional uncertainty weighting.
         
         Args:
-            emo_logits: 27-class emotion logits [batch_size, 27]
-            emo_targets: 27-class targets [batch_size]
             hid_logits: Binary hidden flag logits [batch_size]
             hid_targets: Binary targets [batch_size]
             hidden6_logits: 6-class hidden emotion logits [batch_size, 6]
             hidden6_targets: 6-class targets [batch_size]
         """
-        l_emo = self.emo_loss(emo_logits, emo_targets)
-        
         hid_targets_float = hid_targets.float() if hid_targets.dtype != torch.float32 else hid_targets
         l_hid = self.hid_loss(hid_logits, hid_targets_float)
         
@@ -435,38 +401,34 @@ class EnhancedMultitaskLoss(nn.Module):
         
         if self.use_uncertainty_weighting:
             # Uncertainty weighting: L = sum(L_i * exp(-s_i) + s_i)
-            precision_emo = torch.exp(-self.log_emotion_var)
             precision_hid = torch.exp(-self.log_hidden_var)
             precision_hid6 = torch.exp(-self.log_hidden6_var)
             
-            total_loss = (precision_emo * l_emo + self.log_emotion_var +
-                         precision_hid * l_hid + self.log_hidden_var +
+            total_loss = (precision_hid * l_hid + self.log_hidden_var +
                          precision_hid6 * l_hidden6 + self.log_hidden6_var)
         else:
-            total_loss = l_emo + self.hidden_weight * l_hid + self.hidden6_weight * l_hidden6
+            total_loss = l_hid + self.hidden_weight * l_hidden6
         
-        return total_loss, l_emo, l_hid, l_hidden6
+        return total_loss, l_hid, l_hidden6
 
 # ============================================================================
-# 3. DATASET/COLLATE UPGRADE - ADD HIDDEN6_LABELS
+# 3. DATASET/COLLATE - 2 TASKS
 # ============================================================================
 
 class EmotionHiddenDataset(Dataset):
-    """Dataset with 27-class emotion, binary hidden flag, and 6-class hidden emotion"""
+    """Dataset with binary hidden flag and 6-class hidden emotion"""
     
-    def __init__(self, texts, emo_ids, hid_ids, hidden6_ids, emojis,
+    def __init__(self, texts, hid_ids, hidden6_ids, emojis,
                  augment=False, minority_classes=None):
         self.texts = list(texts)
-        self.emo_ids = list(emo_ids)          # 27-class
         self.hid_ids = list(hid_ids)           # binary flag
-        self.hidden6_ids = list(hidden6_ids)   # 6-class hidden emotion (NEW)
+        self.hidden6_ids = list(hidden6_ids)   # 6-class hidden emotion
         self.emojis = list(emojis)
         self.augment = augment
         self.minority_classes = minority_classes or [3, 4, 5]
-        self.class_distribution = Counter(emo_ids)
         
         logger.info(f"Created dataset with {len(self.texts)} samples")
-        logger.info(f"27-class distribution: {dict(self.class_distribution)}")
+        logger.info(f"6-class distribution: {dict(Counter(hidden6_ids))}")
     
     def __len__(self):
         return len(self.texts)
@@ -474,12 +436,11 @@ class EmotionHiddenDataset(Dataset):
     def __getitem__(self, idx):
         raw_text = self.texts[idx]
         emoji_char = self.emojis[idx] if idx < len(self.emojis) else ""
-        emotion_id = self.emo_ids[idx]
-        hidden6_id = self.hidden6_ids[idx]  # NEW
+        hidden6_id = self.hidden6_ids[idx]
         
         # Simple text augmentation for minority classes
         if self.augment and np.random.random() < 0.3:
-            if emotion_id in self.minority_classes:
+            if hidden6_id in self.minority_classes:
                 variations = [
                     f"I feel {raw_text}",
                     f"{raw_text} honestly",
@@ -489,14 +450,14 @@ class EmotionHiddenDataset(Dataset):
                 raw_text = np.random.choice(variations)
         
         proc_text = build_input(raw_text, emoji_char)
-        return proc_text, emotion_id, self.hid_ids[idx], hidden6_id  # Added hidden6_id
+        return proc_text, self.hid_ids[idx], hidden6_id
 
 
 def collate_fn(batch, tokenizer, max_length: int = 128):
     """
-    Collate function with 3 labels: emotion, hidden_flag, hidden6
+    Collate function with 2 labels: hidden_flag, hidden6
     """
-    texts, emo_ids, hid_ids, hidden6_ids = zip(*batch)
+    texts, hid_ids, hidden6_ids = zip(*batch)
     
     enc = tokenizer(
         list(texts),
@@ -506,37 +467,26 @@ def collate_fn(batch, tokenizer, max_length: int = 128):
         return_tensors="pt",
     )
     
-    enc["emotion_labels"] = torch.tensor(emo_ids, dtype=torch.long)        # 27-class
     enc["hidden_labels"] = torch.tensor(hid_ids, dtype=torch.float)        # binary flag
-    enc["hidden6_labels"] = torch.tensor(hidden6_ids, dtype=torch.long)    # 6-class (NEW)
+    enc["hidden6_labels"] = torch.tensor(hidden6_ids, dtype=torch.long)    # 6-class
     
     return enc
 
 # ============================================================================
-# 4. FEATURE FUSION - Already included in model above
-# ============================================================================
-# The emoji_emotion embedding fusion is integrated in the model forward method
-# It takes emoji_emotion_ids (6-class) and fuses with CLS via concatenation
-
-# ============================================================================
-# 5. EVALUATION UPGRADE - ADD 6-CLASS METRICS
+# 4. EVALUATION - 2 TASKS
 # ============================================================================
 
 def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", use_amp=False):
     """
-    Enhanced evaluation with 3-task metrics
+    Enhanced evaluation with 2-task metrics
     """
     model.eval()
-    
-    # 27-class emotion metrics
-    all_true_emo, all_pred_emo = [], []
-    all_emo_probs = []
     
     # Binary hidden flag metrics
     all_true_hid, all_pred_hid = [], []
     all_hid_probs = []
     
-    # 6-class hidden emotion metrics (NEW)
+    # 6-class hidden emotion metrics
     all_true_hidden6, all_pred_hidden6 = [], []
     all_hidden6_probs = []
     
@@ -549,52 +499,40 @@ def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", us
             # Move to device with correct dtypes
             input_ids = batch["input_ids"].to(device).long()
             attention_mask = batch["attention_mask"].to(device).float()
-            emotion_labels = batch["emotion_labels"].to(device).long()
             hidden_labels = batch["hidden_labels"].to(device).float()
-            hidden6_labels = batch["hidden6_labels"].to(device).long()  # NEW
+            hidden6_labels = batch["hidden6_labels"].to(device).long()
             
-            # Forward pass
-            emo_logits, hid_logits, hidden6_logits = model(
+            # Forward pass - now returns 2 outputs
+            hid_logits, hidden6_logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask
-                # emoji_emotion_ids not used in eval (can be added if available)
             )
             
             if criterion is not None:
-                loss, l_emo, l_hid, l_hid6 = criterion(
-                    emo_logits, emotion_labels,
+                loss, l_hid, l_hid6 = criterion(
                     hid_logits, hidden_labels,
                     hidden6_logits, hidden6_labels
                 )
                 total_loss += loss.item()
                 num_batches += 1
             
-            # 27-class predictions
-            emo_probs = F.softmax(emo_logits, dim=-1)
-            emo_preds = emo_logits.argmax(dim=-1)
-            
             # Binary flag predictions
             hid_probs = torch.sigmoid(hid_logits)
             hid_preds = (hid_probs > 0.5).long()
             
-            # 6-class hidden emotion predictions (NEW)
+            # 6-class hidden emotion predictions
             hidden6_probs = F.softmax(hidden6_logits, dim=-1)
             hidden6_preds = hidden6_logits.argmax(dim=-1)
             
-            # Confidence (max probability of 27-class)
-            confidences = emo_probs.max(dim=-1)[0]
-            
-            # Store 27-class
-            all_true_emo.extend(emotion_labels.cpu().numpy())
-            all_pred_emo.extend(emo_preds.cpu().numpy())
-            all_emo_probs.extend(emo_probs.cpu().numpy())
+            # Confidence (max probability of 6-class)
+            confidences = hidden6_probs.max(dim=-1)[0]
             
             # Store binary flag
             all_true_hid.extend(hidden_labels.cpu().numpy())
             all_pred_hid.extend(hid_preds.cpu().numpy())
             all_hid_probs.extend(hid_probs.cpu().numpy())
             
-            # Store 6-class (NEW)
+            # Store 6-class
             all_true_hidden6.extend(hidden6_labels.cpu().numpy())
             all_pred_hidden6.extend(hidden6_preds.cpu().numpy())
             all_hidden6_probs.extend(hidden6_probs.cpu().numpy())
@@ -602,45 +540,11 @@ def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", us
             all_confidences.extend(confidences.cpu().numpy())
     
     # Convert to numpy arrays
-    all_true_emo = np.array(all_true_emo)
-    all_pred_emo = np.array(all_pred_emo)
     all_true_hid = np.array(all_true_hid)
     all_pred_hid = np.array(all_pred_hid)
     all_true_hidden6 = np.array(all_true_hidden6)
     all_pred_hidden6 = np.array(all_pred_hidden6)
     all_confidences = np.array(all_confidences)
-    
-    # =======================================================================
-    # 27-CLASS EMOTION METRICS
-    # =======================================================================
-    print("\n" + "=" * 70)
-    print("27-CLASS EMOTION CLASSIFICATION REPORT")
-    print("=" * 70)
-    
-    unique_classes = np.unique(np.concatenate([all_true_emo, all_pred_emo]))
-    target_names = [f"class_{i}" for i in unique_classes]
-    print(classification_report(
-        all_true_emo, all_pred_emo,
-        labels=unique_classes, target_names=target_names,
-        digits=4, zero_division=0
-    ))
-    
-    # Per-class accuracy
-    print("\nPER-CLASS ACCURACY (27-class):")
-    cm_emo = confusion_matrix(all_true_emo, all_pred_emo, labels=unique_classes)
-    for i, class_id in enumerate(unique_classes):
-        total = cm_emo[i].sum()
-        correct = cm_emo[i, i]
-        acc = correct / total if total > 0 else 0
-        print(f"Class {int(class_id):2d}: {acc:.4f} ({correct}/{total})")
-    
-    macro_acc = accuracy_score(all_true_emo, all_pred_emo)
-    macro_f1 = f1_score(all_true_emo, all_pred_emo, average='macro', zero_division=0)
-    weighted_f1 = f1_score(all_true_emo, all_pred_emo, average='weighted', zero_division=0)
-    
-    print(f"\nOverall Accuracy:  {macro_acc:.4f}")
-    print(f"Macro F1-Score:    {macro_f1:.4f}")
-    print(f"Weighted F1-Score: {weighted_f1:.4f}")
     
     # =======================================================================
     # BINARY HIDDEN FLAG METRICS
@@ -674,13 +578,13 @@ def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", us
     print(f"       Pos    {cm_hid[1,0]:4d}  {cm_hid[1,1]:4d}")
     
     # =======================================================================
-    # 6-CLASS HIDDEN EMOTION METRICS (NEW)
+    # 6-CLASS HIDDEN EMOTION METRICS
     # =======================================================================
     print("\n" + "=" * 70)
     print("6-CLASS HIDDEN EMOTION CLASSIFICATION REPORT")
     print("=" * 70)
     
-    # Define emotion names (customize based on your mapping)
+    # Define emotion names
     emotion_names = ['joy', 'sadness', 'anger', 'fear', 'surprise', 'love']
     
     unique_h6 = np.unique(np.concatenate([all_true_hidden6, all_pred_hidden6]))
@@ -725,11 +629,6 @@ def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", us
         print(f"\nValidation Loss: {avg_loss:.4f}")
     
     metrics = {
-        # 27-class metrics
-        "emo_accuracy": macro_acc,
-        "emo_macro_f1": macro_f1,
-        "emo_weighted_f1": weighted_f1,
-        
         # Binary flag metrics
         "hid_accuracy": acc_hid,
         "hid_precision": prec_hid,
@@ -737,14 +636,13 @@ def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", us
         "hid_f1": f1_hid,
         "hid_auc": hid_auc,
         
-        # 6-class metrics (NEW)
+        # 6-class metrics
         "hidden6_accuracy": macro_acc_h6,
         "hidden6_macro_f1": macro_f1_h6,
         "hidden6_weighted_f1": weighted_f1_h6,
         
         "avg_confidence": np.mean(all_confidences),
-        "emo_probs": all_emo_probs,
-        "predictions": all_pred_emo,
+        "hid_probs": all_hid_probs,
         "hidden6_predictions": all_pred_hidden6,
         "hidden6_probs": all_hidden6_probs
     }
@@ -755,11 +653,11 @@ def evaluate_model_advanced(model, dataloader, criterion=None, device="cuda", us
     return metrics
 
 # ============================================================================
-# LAYER-WISE LEARNING RATE DECAY
+# LAYER-WISE LEARNING RATE DECAY - UPDATED FOR 2 TASKS
 # ============================================================================
 
 def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
-    """Layer-wise learning rate decay for 3-task model"""
+    """Layer-wise learning rate decay for 2-task model"""
     optimizer_grouped_parameters = []
     
     if hasattr(model.encoder, 'encoder') and hasattr(model.encoder.encoder, 'layer'):
@@ -813,15 +711,7 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'shared_projection'
             })
     
-    # 27-class head
-    if hasattr(model, 'emotion_head'):
-        emotion_params = list(model.emotion_head.parameters())
-        if emotion_params:
-            optimizer_grouped_parameters.append({
-                'params': emotion_params,
-                'lr': base_lr * 2,
-                'name': 'emotion_head'
-            })
+    # REMOVED: 27-class emotion head
     
     # Binary flag head
     if hasattr(model, 'hidden_head'):
@@ -833,7 +723,7 @@ def get_optimizer_with_llrd(model, base_lr=2e-5, decay_factor=0.95):
                 'name': 'hidden_head'
             })
     
-    # 6-class head (NEW)
+    # 6-class head
     if hasattr(model, 'hidden6_head'):
         hidden6_params = list(model.hidden6_head.parameters())
         if hidden6_params:
@@ -897,7 +787,7 @@ def get_scheduler_with_warm_restarts(optimizer, num_training_steps, num_warmup_s
 class AdvancedEarlyStopping:
     """Early stopping with plateau detection"""
     
-    def __init__(self, patience: int = 5, monitor: str = "val_emo_accuracy",
+    def __init__(self, patience: int = 5, monitor: str = "val_hidden6_accuracy",
                  mode: str = "max", min_delta: float = 0.001, plateau_patience: int = 3):
         self.patience = patience
         self.plateau_patience = plateau_patience
@@ -953,12 +843,12 @@ class AdvancedEarlyStopping:
             return {'stop': False, 'reduce_lr': reduce_lr}
 
 # ============================================================================
-# CLASS WEIGHT CALCULATION
+# CLASS WEIGHT CALCULATION (for 6-class if needed)
 # ============================================================================
 
-def calculate_class_weights_advanced(emo_ids: list, method: str = "effective_num",
+def calculate_class_weights_6class(hidden6_ids: list, method: str = "effective_num",
                                      beta: float = 0.999, smooth: float = 1.0) -> dict:
-    emo_counts = Counter(emo_ids)
+    emo_counts = Counter(hidden6_ids)
     num_classes = len(emo_counts)
     
     for i in range(num_classes):
@@ -978,20 +868,19 @@ def calculate_class_weights_advanced(emo_ids: list, method: str = "effective_num
     return class_weights
 
 # ============================================================================
-# MAIN TRAINING FUNCTION
+# MAIN TRAINING FUNCTION - 2 TASKS
 # ============================================================================
 
 def train_model_advanced(config: dict, train_data: dict, val_data: dict,
-                         label_encoder_27, label_encoder_6, device: str):
+                         label_encoder_6, device: str):
     """
-    Main training function with 3-task learning
+    Main training function with 2-task learning
     """
     train_cfg = config['training']
     model_cfg = config['model']
     tokenizer_cfg = config.get('tokenizer', {"max_length": 128})
     
     use_amp = False
-    scaler = None
     
     # Load model/tokenizer
     model_path = get_pretrained_model_path(model_cfg['base_model_name'])
@@ -1014,12 +903,11 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
         tokenizer.add_tokens(new_tokens)
         logger.info(f"Added {len(new_tokens)} special tokens")
     
-    # Create datasets with 3 labels
+    # Create datasets with 2 labels
     train_ds = EmotionHiddenDataset(
         texts=train_data['texts'],
-        emo_ids=train_data['emo_ids'],           # 27-class
         hid_ids=train_data['hid_ids'],           # binary flag
-        hidden6_ids=train_data['hidden6_ids'],   # 6-class (NEW)
+        hidden6_ids=train_data['hidden6_ids'],   # 6-class
         emojis=train_data['emojis'],
         augment=True,
         minority_classes=[3, 4, 5]
@@ -1027,23 +915,16 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
     
     val_ds = EmotionHiddenDataset(
         texts=val_data['texts'],
-        emo_ids=val_data['emo_ids'],
-        hid_ids=val_data['hid_ids'],
-        hidden6_ids=val_data['hidden6_ids'],     # 6-class (NEW)
+        hid_ids=val_data['hid_ids'],             # binary flag
+        hidden6_ids=val_data['hidden6_ids'],     # 6-class
         emojis=val_data['emojis'],
         augment=False
     )
     
-    # Class weights for 27-class
-    class_weights = calculate_class_weights_advanced(
-        train_data['emo_ids'],
-        method="effective_num",
-        beta=0.999
-    )
-    logger.info(f"27-class weights: {class_weights}")
-    
-    # Weighted sampler
-    sample_weights = [class_weights.get(c, 1.0) for c in train_data['emo_ids']]
+    # Optional: Weighted sampler for 6-class imbalance
+    h6_counts = Counter(train_data['hidden6_ids'])
+    h6_weights = calculate_class_weights_6class(train_data['hidden6_ids'])
+    sample_weights = [h6_weights.get(c, 1.0) for c in train_data['hidden6_ids']]
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
     
     # DataLoaders
@@ -1067,11 +948,10 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
         pin_memory=True if device.type == "cuda" else False,
     )
     
-    # Initialize model with 3 tasks
+    # Initialize 2-task model
     model = EnhancedEmotionHiddenModel(
         base_model_name=model_cfg['base_model_name'],
-        num_emotions=model_cfg['num_emotions'],  # 27
-        num_hidden6=6,                           # 6-class
+        num_hidden6=6,
         dropout_p=model_cfg['dropout'],
         local_model_path=model_path,
         use_gradient_checkpointing=train_cfg.get('gradient_checkpointing', False),
@@ -1096,13 +976,11 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
     
-    # Loss function with 3 tasks
+    # Loss function with 2 tasks
     loss_cfg = train_cfg['loss']
     criterion = EnhancedMultitaskLoss(
-        class_weights_dict=class_weights,
         gamma=loss_cfg['focal_gamma'],
-        hidden_weight=loss_cfg['hidden_weight'],      # binary flag weight
-        hidden6_weight=0.6,                            # 6-class weight
+        hidden_weight=loss_cfg['hidden_weight'],
         pos_weight=loss_cfg['pos_weight'],
         label_smoothing=loss_cfg['label_smoothing'],
         device=str(device),
@@ -1125,18 +1003,18 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
         num_cycles=3
     )
     
-    # Early stopping
+    # Early stopping (monitor hidden6 accuracy)
     early_stopping = AdvancedEarlyStopping(
         patience=train_cfg['early_stopping']['patience'],
-        monitor=train_cfg['early_stopping']['monitor'],
-        mode=train_cfg['early_stopping']['mode'],
+        monitor="val_hidden6_accuracy",
+        mode="max",
         min_delta=0.0005,
         plateau_patience=2
     )
     
     # Training loop
     logger.info("\n" + "=" * 70)
-    logger.info("STARTING 3-TASK TRAINING")
+    logger.info("STARTING 2-TASK TRAINING (Hidden Flag + 6-class Hidden Emotion)")
     logger.info("=" * 70)
     
     best_val_acc = 0.0
@@ -1151,7 +1029,7 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
         # Training
         model.train()
         train_loss = 0
-        emo_correct = hid_correct = h6_correct = 0
+        hid_correct = h6_correct = 0
         total_samples = 0
         optimizer.zero_grad()
         
@@ -1159,18 +1037,16 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
             # Move to device
             input_ids = batch["input_ids"].to(device).long()
             attention_mask = batch["attention_mask"].to(device).float()
-            emotion_labels = batch["emotion_labels"].to(device).long()
             hidden_labels = batch["hidden_labels"].to(device).float()
             hidden6_labels = batch["hidden6_labels"].to(device).long()
             
-            # Forward
-            emo_logits, hid_logits, hidden6_logits = model(
+            # Forward - returns 2 outputs
+            hid_logits, hidden6_logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask
             )
             
-            loss, l_emo, l_hid, l_hid6 = criterion(
-                emo_logits, emotion_labels,
+            loss, l_hid, l_hid6 = criterion(
                 hid_logits, hidden_labels,
                 hidden6_logits, hidden6_labels
             )
@@ -1190,37 +1066,31 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
                 optimizer.zero_grad()
             
             # Accuracy
-            emo_preds = emo_logits.argmax(dim=-1)
             hid_preds = (torch.sigmoid(hid_logits) > 0.5).long()
             h6_preds = hidden6_logits.argmax(dim=-1)
             
-            emo_correct += (emo_preds == emotion_labels).sum().item()
             hid_correct += (hid_preds == hidden_labels.long()).sum().item()
             h6_correct += (h6_preds == hidden6_labels).sum().item()
-            total_samples += len(emotion_labels)
+            total_samples += len(hidden_labels)
             train_loss += loss.item() * grad_accum
             
             if (batch_idx + 1) % 50 == 0:
                 logger.info(f"  Batch {batch_idx + 1}/{len(train_loader)} | "
                           f"Loss: {loss.item()*grad_accum:.4f} | "
-                          f"Emo: {emo_correct/total_samples:.3f} | "
                           f"Hid: {hid_correct/total_samples:.3f} | "
                           f"H6: {h6_correct/total_samples:.3f}")
         
         # Epoch metrics
         avg_loss = train_loss / len(train_loader)
-        train_emo_acc = emo_correct / total_samples
         train_hid_acc = hid_correct / total_samples
         train_h6_acc = h6_correct / total_samples
         
         logger.info(f"\nTraining Summary:")
-        logger.info(f"  Loss: {avg_loss:.4f} | Emo: {train_emo_acc:.4f} | "
-                   f"Hid: {train_hid_acc:.4f} | H6: {train_h6_acc:.4f}")
+        logger.info(f"  Loss: {avg_loss:.4f} | Hid: {train_hid_acc:.4f} | H6: {train_h6_acc:.4f}")
         
         if mlflow.active_run():
             mlflow.log_metrics({
                 "train_loss": avg_loss,
-                "train_emo_accuracy": train_emo_acc,
                 "train_hid_accuracy": train_hid_acc,
                 "train_h6_accuracy": train_h6_acc,
             }, step=epoch + 1)
@@ -1231,16 +1101,15 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
         
         if mlflow.active_run():
             mlflow.log_metrics({
-                "val_emo_accuracy": val_metrics["emo_accuracy"],
-                "val_emo_macro_f1": val_metrics["emo_macro_f1"],
                 "val_hid_accuracy": val_metrics["hid_accuracy"],
                 "val_hid_f1": val_metrics["hid_f1"],
+                "val_hid_auc": val_metrics["hid_auc"],
                 "val_hidden6_accuracy": val_metrics["hidden6_accuracy"],
                 "val_hidden6_macro_f1": val_metrics["hidden6_macro_f1"],
             }, step=epoch + 1)
         
-        # Early stopping
-        monitor_metric = val_metrics.get(train_cfg['early_stopping']['monitor'], val_metrics['emo_accuracy'])
+        # Early stopping (monitor hidden6 accuracy)
+        monitor_metric = val_metrics["hidden6_accuracy"]
         result = early_stopping(monitor_metric, model.state_dict(), epoch)
         
         if result['reduce_lr']:
@@ -1251,23 +1120,21 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
             model.load_state_dict(early_stopping.best_model_state)
             break
         
-        # Save best
-        if val_metrics['emo_accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['emo_accuracy']
+        # Save best model based on hidden6 accuracy
+        if val_metrics['hidden6_accuracy'] > best_val_acc:
+            best_val_acc = val_metrics['hidden6_accuracy']
             best_epoch = epoch
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'label_encoder_27': label_encoder_27,
                 'label_encoder_6': label_encoder_6,
-                'class_names_27': list(label_encoder_27.classes_),
                 'class_names_6': list(label_encoder_6.classes_),
                 'tokenizer': tokenizer,
                 'config': config,
                 'val_metrics': val_metrics,
-            }, "best_3task_model.pt")
-            logger.info(f"  ✓ New best model saved! (Acc: {best_val_acc:.4f})")
+            }, "best_2task_model.pt")
+            logger.info(f"  ✓ New best model saved! (H6 Acc: {best_val_acc:.4f})")
     
     # Final evaluation
     if early_stopping.best_model_state is not None:
@@ -1281,12 +1148,12 @@ def train_model_advanced(config: dict, train_data: dict, val_data: dict,
     return model, final_metrics, tokenizer
 
 # ============================================================================
-# MAIN PIPELINE
+# MAIN PIPELINE - UPDATED FOR 2 TASKS
 # ============================================================================
 
 def emotion_train_pipeline(data_path: str = None, dataset_name: str = None):
     """
-    Main training pipeline for 3-task emotion detection
+    Main training pipeline for 2-task emotion detection
     """
     config = load_config()
     
@@ -1323,9 +1190,8 @@ def emotion_train_pipeline(data_path: str = None, dataset_name: str = None):
             experiment_name=config['mlflow']['experiment_name']
         )
     
-    # Load data - Modified to return 6-class encoder as well
-    # Assuming emotion_data_pipeline now returns (train, val, le_27, le_6)
-    train_data, val_data, label_encoder_27, label_encoder_6 = emotion_data_pipeline(data_path=dataset_path)
+    # Load data - now returns 4 values, ignore the 27-class encoder
+    train_data, val_data, _, label_encoder_6 = emotion_data_pipeline(data_path=dataset_path)
     
     with mlflow.start_run():
         mlflow.log_params({
@@ -1337,41 +1203,37 @@ def emotion_train_pipeline(data_path: str = None, dataset_name: str = None):
             "focal_gamma": config['training']['loss']['focal_gamma'],
             "label_smoothing": config['training']['loss']['label_smoothing'],
             "hidden_weight": config['training']['loss']['hidden_weight'],
-            "hidden6_weight": 0.6,
             "scheduler_type": "cosine_with_restarts",
             "mixed_precision": False,
             "layerwise_lr_decay": 0.95,
             "augmentation": "advanced",
-            "tasks": "27class + binary_flag + 6class_hidden"
+            "tasks": "binary_flag + 6class_hidden_emotion"
         })
         
-        # Train
+        # Train 2-task model
         model, metrics, tokenizer = train_model_advanced(
             config, train_data, val_data,
-            label_encoder_27, label_encoder_6, device
+            label_encoder_6, device
         )
         
         # Log final metrics
         for k, v in metrics.items():
-            if isinstance(v, (int, float)) and k not in ['emo_probs', 'predictions', 'hidden6_probs']:
+            if isinstance(v, (int, float)) and k not in ['hid_probs', 'hidden6_predictions', 'hidden6_probs']:
                 mlflow.log_metric(f"final_{k}", v)
         
-        # Save
+        # Save model
         torch.save({
             'model_state_dict': model.state_dict(),
-            'label_encoder_27': label_encoder_27,
             'label_encoder_6': label_encoder_6,
-            'class_names_27': list(label_encoder_27.classes_),
             'class_names_6': list(label_encoder_6.classes_),
             'tokenizer': tokenizer,
             'config': config,
             'final_metrics': {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
-        }, "final_3task_model.pt")
-        logger.info("\nModel saved as 'final_3task_model.pt'")
+        }, "final_2task_model.pt")
+        logger.info("\nModel saved as 'final_2task_model.pt'")
         
         # Log artifacts
         log_pytorch_model(model, artifact_path="model")
-        log_label_encoder(label_encoder_27, "label_encoder_27")
         log_label_encoder(label_encoder_6, "label_encoder_6")
     
     return model, metrics, tokenizer

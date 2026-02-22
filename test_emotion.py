@@ -1,317 +1,684 @@
 """
-Inference script for emotion detection model.
-Updated to work with transformer fine-tuning model.
+Enhanced Testing Script with Deep Context Test Cases
+Tests model performance on nuanced, context-rich social media scenarios
 """
 import os
 import sys
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import logging
-from transformers import AutoTokenizer
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
-
-from utils.config import get_data_paths, get_emotion_categories
-from utils.model_loader import get_pretrained_model_path, get_pretrained_tokenizer_path
-from src.emotion_model import EnhancedEmotionHiddenModel
-from src.emotion_dataset import build_input
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score
 )
-logger = logging.getLogger(__name__)
+from sklearn.preprocessing import LabelEncoder
+from transformers import AutoTokenizer
+import warnings
+warnings.filterwarnings('ignore')
 
+# Add LabelEncoder to PyTorch's safe globals
+import torch.serialization
+torch.serialization.add_safe_globals([LabelEncoder])
 
-class EmotionPredictor:
-    """Predictor for emotion detection using fine-tuned transformer model."""
-    
-    def __init__(self, model_path=None):
-        """
-        Initialize predictor with trained model.
-        
-        Args:
-            model_path: Path to model checkpoint. If None, loads from default location.
-        """
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {self.device}")
-        
-        # Load model checkpoint
-        if model_path is None:
-            data_paths = get_data_paths()
-            model_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                data_paths['model_artifacts_dir']
-            )
-            model_path = os.path.join(model_dir, 'best_emotion_model.pt')
-        
-        logger.info(f"Loading model from: {model_path}")
-        
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model not found at {model_path}. Please train the model first.")
-        
-        checkpoint = torch.load(model_path, map_location=self.device)
-        
-        # Load tokenizer
-        if 'tokenizer' in checkpoint:
-            self.tokenizer = checkpoint['tokenizer']
-        else:
-            # Fallback: load from local cache or download
-            import yaml
-            config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            tokenizer_path = get_pretrained_tokenizer_path(config['model']['base_model_name'])
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        
-        # Load label encoder
-        if 'label_encoder' in checkpoint:
-            self.label_encoder = checkpoint['label_encoder']
-            self.emotion_categories = list(self.label_encoder.classes_)
-        else:
-            self.emotion_categories = get_emotion_categories()
-            self.label_encoder = None
-        
-        # Initialize model
-        num_emotions = len(self.emotion_categories)
-        if 'config' in checkpoint:
-            model_config = checkpoint['config']['model']
-            model_name = model_config['base_model_name']
-            dropout = model_config['dropout']
-        else:
-            import yaml
-            config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            model_name = config['model']['base_model_name']
-            dropout = config['model']['dropout']
-        
-        model_path = get_pretrained_model_path(model_name)
-        self.model = EnhancedEmotionHiddenModel(
-            base_model_name=model_name,
-            num_emotions=num_emotions,
-            dropout_p=dropout,
-            local_model_path=model_path
-        ).to(self.device)
-        
-        # Load model weights
-        if 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint)
-        
-        self.model.eval()
-        logger.info(f"Model loaded successfully. Classes: {self.emotion_categories}")
-    
-    def predict(self, text: str, emoji_char: str = "", return_probabilities: bool = False):
-        """
-        Predict emotion for given text.
-        
-        Args:
-            text: Input text string
-            emoji_char: Primary emoji character (optional)
-            return_probabilities: If True, return probabilities for all classes
-        
-        Returns:
-            If return_probabilities=False: predicted emotion label (str)
-            If return_probabilities=True: (predicted_label, probabilities_dict, has_hidden_emotion, flag_prob)
-        """
-        # Preprocess text (same as training)
-        processed_text = build_input(text, emoji_char)
-        
-        # Tokenize
-        inputs = self.tokenizer(
-            processed_text,
-            padding="max_length",
-            truncation=True,
-            max_length=128,
-            return_tensors="pt"
-        ).to(self.device)
-        
-        # Predict
-        with torch.no_grad():
-            emo_logits, hid_logits = self.model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"]
-            )
-            
-            probabilities = torch.softmax(emo_logits, dim=1)[0].cpu().numpy()
-            predicted_idx = np.argmax(probabilities)
-            
-            # Hidden emotion flag prediction
-            flag_prob = torch.sigmoid(hid_logits)[0].cpu().item()
-            has_hidden_emotion = flag_prob > 0.5
-        
-        predicted_emotion = self.emotion_categories[predicted_idx]
-        
-        if return_probabilities:
-            prob_dict = {
-                emotion: float(probabilities[i])
-                for i, emotion in enumerate(self.emotion_categories)
-            }
-            return predicted_emotion, prob_dict, has_hidden_emotion, flag_prob
-        
-        return predicted_emotion
-    
-    def predict_batch(self, texts: list, emojis: list = None):
-        """
-        Predict emotions for multiple texts.
-        
-        Args:
-            texts: List of text strings
-            emojis: Optional list of emoji characters
-        
-        Returns:
-            List of prediction dictionaries
-        """
-        if emojis is None:
-            emojis = [""] * len(texts)
-        
-        results = []
-        for text, emoji_char in zip(texts, emojis):
-            emotion, probs, has_hidden, flag_prob = self.predict(text, emoji_char, return_probabilities=True)
-            results.append({
-                'text': text,
-                'predicted_emotion': emotion,
-                'probabilities': probs,
-                'has_hidden_emotion': has_hidden,
-                'hidden_emotion_confidence': flag_prob
-            })
-        return results
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from pipelines.emotion_train_pipeline import EnhancedEmotionHiddenModel
+from pipelines.emotion_data_pipeline import emotion_data_pipeline
+from src.preprocessing import build_input
 
-def test_sample_texts():
-    """Test the model with sample texts."""
-    logger.info("="*60)
-    logger.info("EMOTION DETECTION - SAMPLE PREDICTIONS")
-    logger.info("="*60)
-    
-    # Initialize predictor
-    try:
-        predictor = EmotionPredictor()
-    except FileNotFoundError as e:
-        logger.error(f"{e}\nPlease train the model first by running: python pipelines/emotion_train_pipeline.py")
-        return
-    
-    # Test samples covering different emotions
-    test_samples = [
-        # Joy
-        ("I just got accepted into my dream university! This is the best day ever! 🥰", "Joy", "🥰"),
-        ("Had the most amazing time with friends today, laughing till my stomach hurt 😂", "Joy", "😂"),
-        
-        # Anger
-        ("I can't believe they cancelled my flight AGAIN! This is absolutely ridiculous 😡", "Anger", "😡"),
-        ("Are you seriously late AGAIN? We talked about this! 😒", "Anger", "😒"),
-        
-        # Sadness
-        ("I miss my grandma so much, wish she was still here with us 😢", "Sadness", "😢"),
-        ("Feeling so alone tonight, nobody understands what I'm going through 😭", "Sadness", "😭"),
-        
-        # Fear
-        ("Walking alone at night and heard footsteps behind me, I'm terrified 😱", "Fear", "😱"),
-        ("What if I fail this exam? My whole future depends on it 😨", "Fear", "😨"),
-        
-        # Love
-        ("My partner surprised me with breakfast in bed, I'm so lucky to have them ❤️", "Love", "❤️"),
-        ("Watching my baby sleep peacefully, my heart is so full 🥰", "Love", "🥰"),
-        
-        # Surprise
-        ("WHAT?! They actually threw me a surprise party! I had no idea! 😲", "Surprise", "😲"),
-        ("I can't believe I won the lottery! This is insane! 🤯", "Surprise", "🤯")
-    ]
-    
-    print("\n" + "="*70)
-    correct = 0
-    
-    for i, (text, expected, emoji_char) in enumerate(test_samples, 1):
-        emotion, probs, has_hidden, flag_prob = predictor.predict(text, emoji_char, return_probabilities=True)
-        is_correct = emotion.lower() == expected.lower()
-        correct += is_correct
-        
-        status = "✓" if is_correct else "✗"
-        hidden_status = "🔍" if has_hidden else "👁️"
-        print(f"\n{status} Test {i}: Expected {expected.upper()}")
-        print(f"   Text: {text[:60]}...")
-        print(f"   Predicted: {emotion.upper()} {hidden_status} (Hidden: {flag_prob:.2f})")
-        print(f"   Confidence: {probs[emotion]*100:.1f}%")
-        
-        # Show top 3 probabilities
-        sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
-        print(f"   Top 3:")
-        for emo, prob in sorted_probs[:3]:
-            bar = "█" * int(prob * 20)
-            print(f"      {emo:10s} {bar} {prob*100:5.1f}%")
-    
-    print("\n" + "="*70)
-    accuracy = 100 * correct / len(test_samples)
-    print(f"Sample Test Accuracy: {correct}/{len(test_samples)} ({accuracy:.1f}%)")
-    print("="*70 + "\n")
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+MODEL_PATH = "final_2task_model.pt"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MAX_LENGTH = 128
 
+print("=" * 80)
+print("DEEP CONTEXT TEST CASES FOR EMOTION DETECTION MODEL")
+print("=" * 80)
+print(f"Device: {DEVICE}")
+print(f"Model: {MODEL_PATH}")
 
-def interactive_mode():
-    """Interactive mode for testing custom inputs."""
-    logger.info("Starting interactive emotion detection...")
-    logger.info("Enter text to analyze (or 'quit' to exit)")
-    
-    try:
-        predictor = EmotionPredictor()
-    except FileNotFoundError as e:
-        logger.error(f"{e}\nPlease train the model first by running: python pipelines/emotion_train_pipeline.py")
-        return
-    
-    while True:
-        print("\n" + "-"*60)
-        text = input("Enter text: ").strip()
-        
-        if text.lower() in ['quit', 'exit', 'q']:
-            print("Goodbye!")
-            break
-        
-        if not text:
-            print("Please enter some text.")
-            continue
-        
-        emoji_input = input("Enter emoji (optional, press Enter to skip): ").strip()
-        
-        emotion, probs, has_hidden, flag_prob = predictor.predict(text, emoji_input, return_probabilities=True)
-        
-        hidden_status = "🔍 Hidden emotion detected!" if has_hidden else "👁️ Direct emotion"
-        print(f"\n🎯 Predicted Emotion: {emotion.upper()}")
-        print(f"   Confidence: {probs[emotion]*100:.1f}%")
-        print(f"   {hidden_status} (confidence: {flag_prob:.2f})")
-        print(f"\n📊 All Probabilities:")
-        for emo in predictor.emotion_categories:
-            bar_length = int(probs[emo] * 50)
-            bar = "█" * bar_length + "░" * (50 - bar_length)
-            print(f"   {emo:10s} [{bar}] {probs[emo]*100:.1f}%")
+# ============================================================================
+# LOAD MODEL
+# ============================================================================
+print("\n" + "=" * 80)
+print("1. LOADING MODEL")
+print("=" * 80)
 
+# Load model
+checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
 
-if __name__ == "__main__":
-    import argparse
+if 'model_state_dict' in checkpoint:
+    state_dict = checkpoint['model_state_dict']
+else:
+    state_dict = checkpoint
+
+# Get vocabulary size
+embedding_weight = None
+for key in state_dict.keys():
+    if 'word_embeddings.weight' in key:
+        embedding_weight = state_dict[key]
+        break
+
+vocab_size = embedding_weight.shape[0] if embedding_weight is not None else 128100
+
+# Initialize model
+model = EnhancedEmotionHiddenModel(
+    base_model_name="microsoft/deberta-v3-base",
+    num_hidden6=6,
+    dropout_p=0.3
+).to(DEVICE)
+
+model.encoder.resize_token_embeddings(vocab_size)
+model.load_state_dict(state_dict, strict=False)
+model = model.float()
+model.eval()
+
+# Load tokenizer
+if 'tokenizer' in checkpoint:
+    tokenizer = checkpoint['tokenizer']
+else:
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-base")
+    special_tokens = ['[EMOJI=', '[CONFLICT_POS_EMOJI_NEG_TEXT]', '[CONFLICT_NEG_EMOJI_POS_TEXT]',
+                      '[SMILE_EMOJI]', '[HEART_EMOJI]', '[CRY_EMOJI]', '[ANGRY_EMOJI]', '[LONG_TEXT]', ']']
+    new_tokens = [t for t in special_tokens if t not in tokenizer.vocab]
+    if new_tokens:
+        tokenizer.add_tokens(new_tokens)
+
+# Load label encoder
+label_encoder_6 = checkpoint.get('label_encoder_6', None)
+if label_encoder_6 is None:
+    # Create default encoder
+    label_encoder_6 = LabelEncoder()
+    label_encoder_6.fit(['joy', 'sadness', 'anger', 'fear', 'surprise', 'love'])
+
+emotion_names = list(label_encoder_6.classes_)
+print(f"✅ Model loaded. Emotion classes: {emotion_names}")
+
+# ============================================================================
+# 2. CUSTOM DEEP CONTEXT TEST CASES
+# ============================================================================
+print("\n" + "=" * 80)
+print("2. DEEP CONTEXT TEST CASES")
+print("=" * 80)
+
+def predict_single(text, emoji_char=""):
+    """Predict for a single text with emoji context"""
+    proc_text = build_input(text, emoji_char)
     
-    parser = argparse.ArgumentParser(description='Test emotion detection model')
-    parser.add_argument('--mode', choices=['sample', 'interactive'], default='sample',
-                       help='Testing mode: sample (predefined texts) or interactive (enter custom text)')
-    parser.add_argument('--text', type=str, help='Single text to predict')
-    parser.add_argument('--emoji', type=str, default='', help='Emoji character for single prediction')
+    enc = tokenizer(
+        proc_text,
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        return_tensors="pt"
+    )
     
-    args = parser.parse_args()
+    input_ids = enc["input_ids"].to(DEVICE).long()
+    attention_mask = enc["attention_mask"].to(DEVICE).float()
     
-    if args.text:
-        # Single prediction
-        try:
-            predictor = EmotionPredictor()
-            emotion, probs, has_hidden, flag_prob = predictor.predict(args.text, args.emoji, return_probabilities=True)
-            hidden_status = "🔍 Hidden" if has_hidden else "👁️ Direct"
-            print(f"\n📝 Text: {args.text}")
-            print(f"🎯 Predicted: {emotion.upper()} ({probs[emotion]*100:.1f}% confidence)")
-            print(f"🔍 Emotion Type: {hidden_status} (confidence: {flag_prob:.2f})")
-            print(f"\nAll probabilities:")
-            for emo, prob in sorted(probs.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {emo:10s}: {prob*100:.1f}%")
-        except FileNotFoundError as e:
-            logger.error(f"{e}\nPlease train the model first by running: python pipelines/emotion_train_pipeline.py")
-    elif args.mode == 'interactive':
-        interactive_mode()
-    else:
-        test_sample_texts()
+    with torch.no_grad():
+        hid_logits, h6_logits = model(input_ids, attention_mask)
+        
+        hid_prob = torch.sigmoid(hid_logits).cpu().float().item()
+        h6_probs = F.softmax(h6_logits, dim=-1).cpu().float().numpy()[0]
+        
+        hid_pred = "🔴 HIDDEN" if hid_prob > 0.5 else "🟢 NOT HIDDEN"
+        h6_pred_idx = np.argmax(h6_probs)
+        h6_pred = emotion_names[h6_pred_idx]
+        h6_conf = h6_probs[h6_pred_idx]
+        
+        # Get top 3 predictions
+        top_indices = np.argsort(h6_probs)[-3:][::-1]
+        top_emotions = [f"{emotion_names[i]} ({h6_probs[i]:.2f})" for i in top_indices]
+    
+    return {
+        'hidden': hid_pred,
+        'hidden_prob': hid_prob,
+        'hidden_conf': abs(hid_prob - 0.5) * 2,
+        'emotion': h6_pred,
+        'emotion_conf': h6_conf,
+        'top_3': top_emotions,
+        'all_probs': {emotion_names[i]: float(h6_probs[i]) for i in range(len(emotion_names))}
+    }
+
+# ============================================================================
+# TEST CASE CATEGORIES
+# ============================================================================
+
+test_cases = [
+    # ===== SARCASM & IRONY =====
+    {
+        'category': 'Sarcasm',
+        'description': 'Sarcastic positive statement with negative emoji',
+        'text': "Oh great, another Monday. Just what I needed 🙃",
+        'emoji': "🙃",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Upside-down face indicates sarcasm - actually feeling negative'
+    },
+    {
+        'category': 'Sarcasm',
+        'description': 'Sarcastic congratulations',
+        'text': "Congratulations on being the most annoying person ever 👏",
+        'emoji': "👏",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'anger',
+        'explanation': 'Clapping emoji with insult - hidden anger/frustration'
+    },
+    {
+        'category': 'Irony',
+        'description': 'Ironic statement about happiness',
+        'text': "I'm so happy I could cry. Actually, I am crying.",
+        'emoji': "😢",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Direct expression of sadness despite claiming happiness'
+    },
+
+    # ===== EMOTIONAL CONFLICT =====
+    {
+        'category': 'Emotional Conflict',
+        'description': 'Mixed feelings about a relationship',
+        'text': "I love them but they make me so angry sometimes. It's complicated.",
+        'emoji': "💔",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Broken heart emoji with love/anger conflict - hidden sadness'
+    },
+    {
+        'category': 'Emotional Conflict',
+        'description': 'Happy on surface, sad inside',
+        'text': "Posted a happy photo but I'm dying inside. Fake it till you make it.",
+        'emoji': "😊",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Classic hidden emotion - smiling outside, sad inside'
+    },
+    {
+        'category': 'Emotional Conflict',
+        'description': 'Angry but using laughing emoji',
+        'text': "My flight got cancelled. Again. This is hilarious 😂",
+        'emoji': "😂",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'anger',
+        'explanation': 'Laughing emoji masks genuine anger/frustration'
+    },
+
+    # ===== SUBTLE SOCIAL CUES =====
+    {
+        'category': 'Subtle Cues',
+        'description': 'Polite rejection',
+        'text': "That's an interesting idea. I'll definitely consider it.",
+        'emoji': "😐",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'surprise',
+        'explanation': 'Polite way of saying no - hidden surprise/disagreement'
+    },
+    {
+        'category': 'Subtle Cues',
+        'description': 'Passive-aggressive comment',
+        'text': "It's fine. Everything is totally fine. Not like I care or anything.",
+        'emoji': "😤",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'anger',
+        'explanation': 'Steamed face emoji with denial - clearly angry'
+    },
+    {
+        'category': 'Subtle Cues',
+        'description': 'Understated excitement',
+        'text': "Got the job. That's pretty cool I guess.",
+        'emoji': "😌",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'joy',
+        'explanation': 'Relieved face masks genuine excitement'
+    },
+
+    # ===== DIRECT EMOTIONS =====
+    {
+        'category': 'Direct',
+        'description': 'Clear joy',
+        'text': "I'm so excited! Got promoted at work today! 🎉",
+        'emoji': "🎉",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'joy',
+        'explanation': 'Direct expression of joy with celebration emoji'
+    },
+    {
+        'category': 'Direct',
+        'description': 'Clear sadness',
+        'text': "My dog passed away. I'm devastated.",
+        'emoji': "😭",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Direct expression of grief'
+    },
+    {
+        'category': 'Direct',
+        'description': 'Clear fear',
+        'text': "I have a job interview in an hour and I'm terrified.",
+        'emoji': "😨",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'fear',
+        'explanation': 'Direct expression of anxiety'
+    },
+
+    # ===== SOCIAL MEDIA SHORTHAND =====
+    {
+        'category': 'Shorthand',
+        'description': 'Texting shorthand',
+        'text': "omg i cant even rn tbh",
+        'emoji': "😩",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Weary face with vague text - hidden overwhelm'
+    },
+    {
+        'category': 'Shorthand',
+        'description': 'Acronym usage',
+        'text': "lmao this is fine everything is fine 🔥",
+        'emoji': "🔥",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'anger',
+        'explanation': 'Fire emoji with "this is fine" - hidden panic/anger'
+    },
+    {
+        'category': 'Shorthand',
+        'description': 'Repeated letters for emphasis',
+        'text': "Nooooooooooo whyyyyyyy",
+        'emoji': "😫",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Tired face with drawn-out words - hidden distress'
+    },
+
+    # ===== EMPATHY & SUPPORT =====
+    {
+        'category': 'Empathy',
+        'description': 'Supportive but concerned',
+        'text': "I'm here for you if you need to talk. Stay strong.",
+        'emoji': "🤗",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'love',
+        'explanation': 'Open-hearted support'
+    },
+    {
+        'category': 'Empathy',
+        'description': 'Sharing someone else\'s pain',
+        'text': "Reading this broke my heart. Sending love.",
+        'emoji': "💔",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Direct expression of empathy'
+    },
+
+    # ===== NARRATIVE CONTEXT =====
+    {
+        'category': 'Narrative',
+        'description': 'Story with emotional twist',
+        'text': "She said yes! Wait no, she was joking. Haha... ha...",
+        'emoji': "😅",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Sweating smile masks disappointment'
+    },
+    {
+        'category': 'Narrative',
+        'description': 'Building suspense',
+        'text': "I have something to tell you. But maybe later. Or never. Idk.",
+        'emoji': "🤐",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'fear',
+        'explanation': 'Zipped mouth - hidden anxiety/fear'
+    },
+
+    # ===== CULTURAL REFERENCES =====
+    {
+        'category': 'Cultural',
+        'description': 'Movie reference',
+        'text': "You can't handle the truth!",
+        'emoji': "😤",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'anger',
+        'explanation': 'Famous line delivered with anger - but is it real?'
+    },
+    {
+        'category': 'Cultural',
+        'description': 'Song lyrics',
+        'text': "I'm a survivor, I'm not gonna give up",
+        'emoji': "💪",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'joy',
+        'explanation': 'Empowering lyrics - genuine confidence'
+    },
+    {
+        'category': 'Cultural',
+        'description': 'Meme reference',
+        'text': "This is fine. Everything is fine. 🔥🐶🔥",
+        'emoji': "🔥",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'fear',
+        'explanation': 'Classic "this is fine" meme - hidden panic'
+    },
+
+    # ===== EMOTIONAL NUANCE =====
+    {
+        'category': 'Nuance',
+        'description': 'Bittersweet moment',
+        'text': "My last day at work. Gonna miss these crazies.",
+        'emoji': "🥲",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Smiling through tears - hidden sadness'
+    },
+    {
+        'category': 'Nuance',
+        'description': 'Relief after stress',
+        'text': "Finally done with exams. I can breathe.",
+        'emoji': "😮‍💨",
+        'expected_hidden': 'NOT HIDDEN',
+        'expected_emotion': 'joy',
+        'explanation': 'Visible relief - genuine joy'
+    },
+    {
+        'category': 'Nuance',
+        'description': 'Anticipatory anxiety',
+        'text': "Tomorrow's the big day. Can't sleep. What if I mess up?",
+        'emoji': "😬",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'fear',
+        'explanation': 'Grimacing face - hidden anxiety'
+    },
+
+    # ===== CONTRADICTORY SIGNALS =====
+    {
+        'category': 'Contradiction',
+        'description': 'Positive words, negative emoji',
+        'text': "Having a great time! This is fine.",
+        'emoji': "😠",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'anger',
+        'explanation': 'Angry face contradicts happy words - hidden anger'
+    },
+    {
+        'category': 'Contradiction',
+        'description': 'Negative words, positive emoji',
+        'text': "I want to die. Just kidding lol 😂",
+        'emoji': "😂",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'sadness',
+        'explanation': 'Laughing emoji masks serious statement - hidden sadness'
+    },
+    {
+        'category': 'Contradiction',
+        'description': 'Neutral words, extreme emoji',
+        'text': "The meeting is at 3pm.",
+        'emoji': "🤯",
+        'expected_hidden': 'HIDDEN',
+        'expected_emotion': 'surprise',
+        'explanation': 'Exploding head over mundane info - hidden shock/overwhelm'
+    },
+]
+
+# ============================================================================
+# 3. RUN TEST CASES
+# ============================================================================
+print("\n" + "=" * 80)
+print("3. TEST RESULTS")
+print("=" * 80)
+
+results = []
+correct_hidden = 0
+correct_emotion = 0
+correct_both = 0
+
+for i, test in enumerate(test_cases, 1):
+    print(f"\n{'-' * 60}")
+    print(f"Test #{i}: {test['category']} - {test['description']}")
+    print(f"{'-' * 60}")
+    print(f"📝 Text: {test['text']}")
+    print(f"😊 Emoji: {test['emoji']}")
+    print(f"💭 Context: {test['explanation']}")
+    
+    # Get prediction
+    result = predict_single(test['text'], test['emoji'])
+    
+    # Determine correctness
+    hidden_correct = (result['hidden'] == f"{'🔴 HIDDEN' if test['expected_hidden'] == 'HIDDEN' else '🟢 NOT HIDDEN'}")
+    emotion_correct = (result['emotion'] == test['expected_emotion'])
+    
+    if hidden_correct:
+        correct_hidden += 1
+    if emotion_correct:
+        correct_emotion += 1
+    if hidden_correct and emotion_correct:
+        correct_both += 1
+    
+    # Store results
+    results.append({
+        'category': test['category'],
+        'description': test['description'],
+        'text': test['text'],
+        'emoji': test['emoji'],
+        'expected_hidden': test['expected_hidden'],
+        'predicted_hidden': result['hidden'],
+        'hidden_conf': result['hidden_conf'],
+        'expected_emotion': test['expected_emotion'],
+        'predicted_emotion': result['emotion'],
+        'emotion_conf': result['emotion_conf'],
+        'hidden_correct': hidden_correct,
+        'emotion_correct': emotion_correct,
+        'top_3': result['top_3']
+    })
+    
+    # Print results
+    print(f"\n📊 Model Prediction:")
+    print(f"   Hidden Flag: {result['hidden']} (conf: {result['hidden_conf']:.3f})")
+    print(f"   Expected:    {'🔴 HIDDEN' if test['expected_hidden'] == 'HIDDEN' else '🟢 NOT HIDDEN'}")
+    print(f"   {'✅' if hidden_correct else '❌'} {'Correct' if hidden_correct else 'Incorrect'}")
+    
+    print(f"\n   Emotion: {result['emotion']} (conf: {result['emotion_conf']:.3f})")
+    print(f"   Expected: {test['expected_emotion']}")
+    print(f"   {'✅' if emotion_correct else '❌'} {'Correct' if emotion_correct else 'Incorrect'}")
+    
+    print(f"\n   Top 3 Emotions: {', '.join(result['top_3'])}")
+    
+    # Show full probability distribution
+    probs_str = ", ".join([f"{e}: {p:.2f}" for e, p in result['all_probs'].items()])
+    print(f"   Full Distribution: {probs_str}")
+
+# ============================================================================
+# 4. SUMMARY STATISTICS
+# ============================================================================
+print("\n" + "=" * 80)
+print("4. SUMMARY STATISTICS")
+print("=" * 80)
+
+total_tests = len(test_cases)
+hidden_acc = (correct_hidden / total_tests) * 100
+emotion_acc = (correct_emotion / total_tests) * 100
+both_acc = (correct_both / total_tests) * 100
+
+print(f"\n📊 Overall Performance on {total_tests} Deep Context Tests:")
+print(f"   Hidden Flag Accuracy:  {hidden_acc:.1f}% ({correct_hidden}/{total_tests})")
+print(f"   Emotion Accuracy:      {emotion_acc:.1f}% ({correct_emotion}/{total_tests})")
+print(f"   Both Correct:          {both_acc:.1f}% ({correct_both}/{total_tests})")
+
+# Performance by category
+print(f"\n📈 Performance by Category:")
+categories = {}
+for result in results:
+    cat = result['category']
+    if cat not in categories:
+        categories[cat] = {'total': 0, 'hidden_correct': 0, 'emotion_correct': 0, 'both_correct': 0}
+    categories[cat]['total'] += 1
+    if result['hidden_correct']:
+        categories[cat]['hidden_correct'] += 1
+    if result['emotion_correct']:
+        categories[cat]['emotion_correct'] += 1
+    if result['hidden_correct'] and result['emotion_correct']:
+        categories[cat]['both_correct'] += 1
+
+for cat, stats in categories.items():
+    hidden_cat_acc = (stats['hidden_correct'] / stats['total']) * 100
+    emotion_cat_acc = (stats['emotion_correct'] / stats['total']) * 100
+    both_cat_acc = (stats['both_correct'] / stats['total']) * 100
+    print(f"\n   {cat}:")
+    print(f"      Hidden: {hidden_cat_acc:.1f}% ({stats['hidden_correct']}/{stats['total']})")
+    print(f"      Emotion: {emotion_cat_acc:.1f}% ({stats['emotion_correct']}/{stats['total']})")
+    print(f"      Both: {both_cat_acc:.1f}% ({stats['both_correct']}/{stats['total']})")
+
+# ============================================================================
+# 5. ERROR ANALYSIS
+# ============================================================================
+print("\n" + "=" * 80)
+print("5. ERROR ANALYSIS")
+print("=" * 80)
+
+# Find cases where model struggled
+print("\n🔍 Cases Where Model Struggled:")
+difficult_cases = [r for r in results if not r['emotion_correct'] or not r['hidden_correct']]
+for i, case in enumerate(difficult_cases[:10], 1):  # Show top 10 difficult cases
+    print(f"\n{i}. {case['category']} - {case['description']}")
+    print(f"   Text: {case['text'][:100]}...")
+    print(f"   Predicted: {case['predicted_hidden']} ({case['predicted_emotion']})")
+    print(f"   Expected:  {case['expected_hidden']} ({case['expected_emotion']})")
+    print(f"   Confidence: Hidden={case['hidden_conf']:.3f}, Emotion={case['emotion_conf']:.3f}")
+
+# Confusion patterns
+print("\n🔄 Emotion Confusion Patterns:")
+confusion_matrix = {}
+for result in results:
+    if not result['emotion_correct']:
+        key = f"{result['expected_emotion']} → {result['predicted_emotion']}"
+        confusion_matrix[key] = confusion_matrix.get(key, 0) + 1
+
+sorted_confusions = sorted(confusion_matrix.items(), key=lambda x: x[1], reverse=True)
+for confusion, count in sorted_confusions[:5]:
+    print(f"   {confusion}: {count} times")
+
+# Hidden flag error patterns
+hidden_fp = [r for r in results if r['expected_hidden'] == 'NOT HIDDEN' and 'HIDDEN' in r['predicted_hidden']]
+hidden_fn = [r for r in results if r['expected_hidden'] == 'HIDDEN' and 'NOT HIDDEN' in r['predicted_hidden']]
+
+print(f"\n🚩 Hidden Flag Errors:")
+print(f"   False Positives: {len(hidden_fp)} cases")
+if hidden_fp:
+    print("   Examples:")
+    for case in hidden_fp[:3]:
+        print(f"     • {case['description']}: '{case['text'][:50]}...'")
+
+print(f"   False Negatives: {len(hidden_fn)} cases")
+if hidden_fn:
+    print("   Examples:")
+    for case in hidden_fn[:3]:
+        print(f"     • {case['description']}: '{case['text'][:50]}...'")
+
+# ============================================================================
+# 6. VISUALIZATION
+# ============================================================================
+print("\n" + "=" * 80)
+print("6. GENERATING VISUALIZATIONS")
+print("=" * 80)
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+# 1. Performance by category
+ax1 = axes[0, 0]
+categories_list = list(categories.keys())
+hidden_scores = [(categories[cat]['hidden_correct']/categories[cat]['total'])*100 for cat in categories_list]
+emotion_scores = [(categories[cat]['emotion_correct']/categories[cat]['total'])*100 for cat in categories_list]
+
+x = np.arange(len(categories_list))
+width = 0.35
+ax1.bar(x - width/2, hidden_scores, width, label='Hidden Flag', color='steelblue')
+ax1.bar(x + width/2, emotion_scores, width, label='Emotion', color='lightcoral')
+ax1.set_xlabel('Category')
+ax1.set_ylabel('Accuracy (%)')
+ax1.set_title('Performance by Category')
+ax1.set_xticks(x)
+ax1.set_xticklabels(categories_list, rotation=45, ha='right')
+ax1.legend()
+ax1.set_ylim(0, 100)
+
+# 2. Confusion matrix heatmap for emotions
+ax2 = axes[0, 1]
+emotion_cm = np.zeros((6, 6))
+for result in results:
+    true_idx = list(emotion_names).index(result['expected_emotion'])
+    pred_idx = list(emotion_names).index(result['predicted_emotion'])
+    emotion_cm[true_idx, pred_idx] += 1
+
+sns.heatmap(emotion_cm, annot=True, fmt='.0f', cmap='YlOrRd', ax=ax2,
+            xticklabels=emotion_names, yticklabels=emotion_names)
+ax2.set_title('Emotion Confusion Matrix')
+ax2.set_xlabel('Predicted')
+ax2.set_ylabel('True')
+
+# 3. Confidence distribution
+ax3 = axes[1, 0]
+correct_confs = [r['emotion_conf'] for r in results if r['emotion_correct']]
+incorrect_confs = [r['emotion_conf'] for r in results if not r['emotion_correct']]
+
+ax3.hist([correct_confs, incorrect_confs], bins=10, 
+         label=['Correct', 'Incorrect'], alpha=0.7, color=['green', 'red'])
+ax3.set_xlabel('Confidence')
+ax3.set_ylabel('Count')
+ax3.set_title('Emotion Confidence Distribution')
+ax3.legend()
+
+# 4. Hidden flag confidence
+ax4 = axes[1, 1]
+hid_correct_confs = [r['hidden_conf'] for r in results if r['hidden_correct']]
+hid_incorrect_confs = [r['hidden_conf'] for r in results if not r['hidden_correct']]
+
+ax4.hist([hid_correct_confs, hid_incorrect_confs], bins=10,
+         label=['Correct', 'Incorrect'], alpha=0.7, color=['steelblue', 'orange'])
+ax4.set_xlabel('Confidence')
+ax4.set_ylabel('Count')
+ax4.set_title('Hidden Flag Confidence Distribution')
+ax4.legend()
+
+plt.tight_layout()
+plt.savefig('deep_context_test_results.png', dpi=150, bbox_inches='tight')
+print("✅ Visualization saved as 'deep_context_test_results.png'")
+
+# ============================================================================
+# 7. EXPORT RESULTS
+# ============================================================================
+print("\n" + "=" * 80)
+print("7. EXPORTING RESULTS")
+print("=" * 80)
+
+# Save detailed results
+results_df = pd.DataFrame(results)
+results_df.to_csv('deep_context_test_results.csv', index=False)
+print("✅ Detailed results saved as 'deep_context_test_results.csv'")
+
+# Save summary
+summary_df = pd.DataFrame({
+    'Metric': ['Total Tests', 'Hidden Flag Accuracy', 'Emotion Accuracy', 'Both Correct'],
+    'Value': [total_tests, f"{hidden_acc:.1f}%", f"{emotion_acc:.1f}%", f"{both_acc:.1f}%"]
+})
+summary_df.to_csv('deep_context_summary.csv', index=False)
+print("✅ Summary saved as 'deep_context_summary.csv'")
+
+print("\n" + "=" * 80)
+print("✅ DEEP CONTEXT TESTING COMPLETE!")
+print("=" * 80)
+print("\nGenerated files:")
+print("   • deep_context_test_results.csv")
+print("   • deep_context_summary.csv")
+print("   • deep_context_test_results.png")
