@@ -21,18 +21,30 @@ data_paths:
 attributes:
   emotion_categories:
     - 'joy'
-    - 'anger'
     - 'sadness'
+    - 'anger'
     - 'fear'
-    - 'love'
     - 'surprise'
+    - 'love'
+  
   required_attributes:
     - 'text'
-    - 'hidden_emotion_label'
+    - 'true_emotion'           # Changed from hidden_emotion_label
     - 'primary_emoji'
-    - 'emoji_emotion'
+    - 'emoji_matches'           # Added from relabeling
+    - 'is_hidden'               # Added from relabeling
+  
+  optional_attributes:
+    - 'hidden_emotion_label'    # Keep original for comparison
+    - 'hidden_emotion_flag'
+    - 'emoji_text_sentiment_match'
+    - 'confidence'               # GPT-4o-mini confidence score
+    - 'reasoning'                # Explanation from GPT
+  
   text_column: 'text'
-  label_column: 'hidden_emotion_label'
+  label_column: 'true_emotion'   # Use the relabeled emotion
+  
+  hidden_flag_column: 'is_hidden' # Use the relabeled hidden flag
 
 model:
   base_model_name: "microsoft/deberta-v3-base"  # Can be changed to roberta-base, bert-base-uncased, etc.
@@ -41,50 +53,196 @@ model:
   freeze_layers: 1  # Reduced from 2 - allow more layers to train
 
 training:
-  num_epochs: 12                    # +2 epochs, let early stopping decide
-  batch_size: 24                    # ↓16, more stable gradients
-  val_batch_size: 64                # keep
-  
-  # ↑ Learning rates (your 5e-6 too low for DeBERTa)
-  learning_rate_encoder: 2e-5       # standard DeBERTa fine-tune LR
-  learning_rate_head: 5e-5          # 2.5x encoder (heads adapt faster)
-  
-  weight_decay: 0.01                # keep
-  max_grad_norm: 1.0                # keep
-  
-  warmup_steps: 0.08                # ↓2%, faster ramp-up
-  scheduler_type: "cosine"          # keep
-  
-  # Early stopping - better metric
+  # ==========================================================================
+  # CORE TRAINING PARAMETERS
+  # ==========================================================================
+  num_epochs: 20                      # Increased for better convergence
+  batch_size: 16                       # Smaller batch for better gradient estimates
+  val_batch_size: 64
+  gradient_accumulation_steps: 2       # Effective batch = 32
+
+  # ==========================================================================
+  # LEARNING RATES - Tuned for better class balance
+  # ==========================================================================
+  learning_rate_encoder: 1.5e-5        # Slightly lower for stability
+  learning_rate_head: 4e-5             # Heads can learn faster
+  weight_decay: 0.02                    # Increased regularization
+  max_grad_norm: 1.0
+  warmup_steps: 0.1                     # 10% warmup (helps stabilize)
+
+  scheduler_type: "cosine_with_restarts"
+  scheduler_cycles: 4                    # More cycles to escape plateaus
+  scheduler_gamma: 0.95                   # LR decay factor per cycle
+
+  # ==========================================================================
+  # EARLY STOPPING - Monitor macro F1 (most important for class balance)
+  # ==========================================================================
   early_stopping:
     enabled: true
-    patience: 4                     # ↓1, more responsive
-    monitor: "val_emo_macro_f1"     # ↑ F1 > accuracy for imbalance
+    patience: 6                          # More patience since we have more epochs
+    monitor: "val_emo_macro_f1"
     mode: "max"
-  
-  # Class weights - more aggressive
+    min_delta: 0.002
+    restore_best_weights: true
+
+  # ==========================================================================
+  # CLASS WEIGHTS - Aggressive for failing classes
+  # ==========================================================================
   class_weights:
     method: "effective_num"
-    beta: 0.99                      # ↓0.009, stronger reweighting
-  
-  # Loss - more focused
+    beta: 0.95                            # Lower beta = stronger weighting
+    soften: false                          # No softening - need strong weights
+    manual_boost:
+      joy: 2.5                             # Boost joy (was 0.0% in first run)
+      love: 8.0                             # Massive boost for love (0% accuracy)
+      fear: 2.5                             # Boost fear (was 0% in first run)
+      anger: 0.8                             # Slightly reduce anger bias
+      surprise: 1.2                          # Slight boost
+      sadness: 1.2                           # Slight boost
+
+  # ==========================================================================
+  # LOSS FUNCTION - Balanced for all classes
+  # ==========================================================================
   loss:
-    focal_gamma: 2.0                # ↑0.5, harder on easy examples
-    hidden_weight: 0.8              # ↑0.3, hidden task more important
-    label_smoothing: 0.02           # ↓0.03, less aggressive
-    pos_weight: 2.2                 # ↑0.7, hidden minority class
-  
-  # Augmentation - more aggressive on minorities
+    focal_gamma: 2.2                        # Increased for better focus on hard examples
+    hidden_weight: 1.0                       # Balanced weight
+    label_smoothing: 0.03                     # Very light smoothing
+    pos_weight: 2.5                           # For hidden flag positive class
+    
+    # Class-specific focal gammas
+    focal_gamma_per_class:
+      joy: 2.5                                 # Higher gamma for joy (hard to learn)
+      love: 3.0                                 # Highest gamma for love (very hard)
+      anger: 1.8                                # Lower gamma for anger (already good)
+      fear: 2.5                                  # Higher for fear
+      surprise: 2.0
+      sadness: 2.0
+    
+    contrastive_weight: 0.15                    # Slightly increased contrastive learning
+    contrastive_temperature: 0.05                # Lower temperature = sharper separation
+
+  # ==========================================================================
+  # DATA AUGMENTATION - Aggressive for minority classes
+  # ==========================================================================
   augmentation:
     enabled: true
-    probability: 0.4                # ↑0.1
-    minority_classes: [2, 3, 4, 5]  # add anger (usually imbalanced)
-  
-  # Data split - keep stable
+    probability: 0.5                              # Increased augmentation
+    minority_classes: [0, 2, 3, 4, 5]             # All except anger? Wait, check indices:
+    # 0: joy, 1: sadness, 2: anger, 3: fear, 4: surprise, 5: love
+    
+    # Class-specific augmentation probabilities
+    class_augment_prob:
+      0: 0.6    # joy - high augmentation
+      5: 0.8    # love - very high augmentation
+      3: 0.6    # fear - high augmentation
+      2: 0.3    # anger - low augmentation (already good)
+      1: 0.4    # sadness - medium
+      4: 0.4    # surprise - medium
+    
+    synonym_replacement_prob: 0.3
+    random_deletion_prob: 0.15
+    random_swap_prob: 0.15
+    back_translation_prob: 0.1                    # Add back-translation for variety
+
+  # ==========================================================================
+  # CLASS-SPECIFIC STRATEGIES
+  # ==========================================================================
+  class_strategies:
+    love:
+      oversample_factor: 3.0                       # Oversample love 3x
+      augment_always: true                          # Always augment love samples
+      loss_boost: 2.0                                # Boost love loss by 2x
+      
+    joy:
+      oversample_factor: 1.5
+      augment_always: false
+      
+    fear:
+      oversample_factor: 1.5
+      
+    anger:
+      undersample_factor: 0.8                        # Reduce anger samples slightly
+
+  # ==========================================================================
+  # OPTIMIZER SETTINGS
+  # ==========================================================================
+  optimizer:
+    type: "AdamW"
+    betas: [0.9, 0.999]
+    eps: 1e-8
+    layerwise_lr_decay: 0.9                         # 0.9 is good
+    
+    # Differential learning rates per module
+    module_lrs:
+      embeddings: 0.5                                 # Half the base LR
+      encoder_layers: 0.8                             # 80% of base
+      pooler: 1.0
+      shared_projection: 2.0
+      bin_head: 3.0
+      emo_head: 3.0
+      temperature: 0.1
+
+  # ==========================================================================
+  # TRAINING STRATEGIES
+  # ==========================================================================
+  strategies:
+    gradient_clipping: true
+    mixed_precision: false                           # Disable if causing dtype issues
+    label_smoothing: true
+    contrastive_learning: true
+    focal_loss: true
+    
+    # Progressive unfreezing
+    progressive_unfreezing:
+      enabled: true
+      start_epoch: 3                                   # Start unfreezing after 3 epochs
+      unfreeze_schedule: [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # Layers to unfreeze per epoch
+    
+    # Curriculum learning
+    curriculum_learning:
+      enabled: true
+      start_with_easy: true
+      difficulty_metric: "text_length"                  # Longer texts are "harder"
+      ramp_epochs: 3
+
+  # ==========================================================================
+  # EVALUATION METRICS
+  # ==========================================================================
+  evaluation:
+    primary_metric: "emo_macro_f1"
+    secondary_metrics: ["emo_weighted_f1", "bin_f1", "class_accuracies"]
+    per_class_report: true
+    confusion_matrix: true
+    
+    # Class-specific thresholds for early stopping
+    class_thresholds:
+      love: 0.15                                         # Stop if love < 15% after epoch 10
+      joy: 0.30
+      fear: 0.30
+
+  # ==========================================================================
+  # TRAIN/VAL SPLIT
+  # ==========================================================================
   train_val_split:
-    test_size: 0.2
+    test_size: 0.15                                      # Slightly smaller validation
     random_state: 42
     stratify: true
+    ensure_min_samples: true
+    min_samples_per_class: 5
+
+  # ==========================================================================
+  # LOGGING AND CHECKPOINTING
+  # ==========================================================================
+  logging:
+    log_interval: 25                                     # Log every 25 steps
+    save_checkpoints: true
+    save_best_only: true
+    checkpoint_metric: "val_emo_macro_f1"
+    
+  # ==========================================================================
+  # RANDOM SEED
+  # ==========================================================================
+  seed: 42
 
 tokenizer:
   max_length: 128

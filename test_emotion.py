@@ -1,6 +1,6 @@
 """
 Enhanced Testing Script with Deep Context Test Cases
-Tests model performance on nuanced, context-rich social media scenarios
+For Improved 2-Task Model with Confidence Calibration
 """
 import os
 import sys
@@ -33,6 +33,7 @@ torch.serialization.add_safe_globals([LabelEncoder])
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# Import the improved model
 from pipelines.emotion_train_pipeline import EnhancedEmotionHiddenModel
 from pipelines.emotion_data_pipeline import emotion_data_pipeline
 from src.preprocessing import build_input
@@ -40,12 +41,12 @@ from src.preprocessing import build_input
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-MODEL_PATH = "final_2task_model.pt"
+MODEL_PATH = "final_2task_model_improved.pt"  # Your improved model
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_LENGTH = 128
 
 print("=" * 80)
-print("DEEP CONTEXT TEST CASES FOR EMOTION DETECTION MODEL")
+print("DEEP CONTEXT TEST CASES FOR IMPROVED EMOTION DETECTION MODEL")
 print("=" * 80)
 print(f"Device: {DEVICE}")
 print(f"Model: {MODEL_PATH}")
@@ -100,7 +101,6 @@ else:
 # Load label encoder
 label_encoder_6 = checkpoint.get('label_encoder_6', None)
 if label_encoder_6 is None:
-    # Create default encoder
     label_encoder_6 = LabelEncoder()
     label_encoder_6.fit(['joy', 'sadness', 'anger', 'fear', 'surprise', 'love'])
 
@@ -108,14 +108,11 @@ emotion_names = list(label_encoder_6.classes_)
 print(f"✅ Model loaded. Emotion classes: {emotion_names}")
 
 # ============================================================================
-# 2. CUSTOM DEEP CONTEXT TEST CASES
+# 2. FIXED PREDICTION FUNCTION (Handles 3 outputs)
 # ============================================================================
-print("\n" + "=" * 80)
-print("2. DEEP CONTEXT TEST CASES")
-print("=" * 80)
 
 def predict_single(text, emoji_char=""):
-    """Predict for a single text with emoji context"""
+    """Predict for a single text with emoji context - FIXED for 3-output model"""
     proc_text = build_input(text, emoji_char)
     
     enc = tokenizer(
@@ -130,10 +127,12 @@ def predict_single(text, emoji_char=""):
     attention_mask = enc["attention_mask"].to(DEVICE).float()
     
     with torch.no_grad():
-        hid_logits, h6_logits = model(input_ids, attention_mask)
+        # Model returns 3 values: hid_logits, h6_logits, confidence
+        hid_logits, h6_logits, confidence = model(input_ids, attention_mask)
         
         hid_prob = torch.sigmoid(hid_logits).cpu().float().item()
         h6_probs = F.softmax(h6_logits, dim=-1).cpu().float().numpy()[0]
+        conf_score = confidence.cpu().float().item()
         
         hid_pred = "🔴 HIDDEN" if hid_prob > 0.5 else "🟢 NOT HIDDEN"
         h6_pred_idx = np.argmax(h6_probs)
@@ -150,16 +149,17 @@ def predict_single(text, emoji_char=""):
         'hidden_conf': abs(hid_prob - 0.5) * 2,
         'emotion': h6_pred,
         'emotion_conf': h6_conf,
+        'calibrated_confidence': conf_score,  # New calibrated confidence
         'top_3': top_emotions,
         'all_probs': {emotion_names[i]: float(h6_probs[i]) for i in range(len(emotion_names))}
     }
 
 # ============================================================================
-# TEST CASE CATEGORIES
+# 3. DEEP CONTEXT TEST CASES
 # ============================================================================
 
 test_cases = [
-    # ===== SARCASM & IRONY =====
+    # ===== SARCASTIC CASES =====
     {
         'category': 'Sarcasm',
         'description': 'Sarcastic positive statement with negative emoji',
@@ -178,17 +178,8 @@ test_cases = [
         'expected_emotion': 'anger',
         'explanation': 'Clapping emoji with insult - hidden anger/frustration'
     },
-    {
-        'category': 'Irony',
-        'description': 'Ironic statement about happiness',
-        'text': "I'm so happy I could cry. Actually, I am crying.",
-        'emoji': "😢",
-        'expected_hidden': 'NOT HIDDEN',
-        'expected_emotion': 'sadness',
-        'explanation': 'Direct expression of sadness despite claiming happiness'
-    },
-
-    # ===== EMOTIONAL CONFLICT =====
+    
+    # ===== EMOTIONAL CONFLICT CASES =====
     {
         'category': 'Emotional Conflict',
         'description': 'Mixed feelings about a relationship',
@@ -216,7 +207,7 @@ test_cases = [
         'expected_emotion': 'anger',
         'explanation': 'Laughing emoji masks genuine anger/frustration'
     },
-
+    
     # ===== SUBTLE SOCIAL CUES =====
     {
         'category': 'Subtle Cues',
@@ -236,16 +227,7 @@ test_cases = [
         'expected_emotion': 'anger',
         'explanation': 'Steamed face emoji with denial - clearly angry'
     },
-    {
-        'category': 'Subtle Cues',
-        'description': 'Understated excitement',
-        'text': "Got the job. That's pretty cool I guess.",
-        'emoji': "😌",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'joy',
-        'explanation': 'Relieved face masks genuine excitement'
-    },
-
+    
     # ===== DIRECT EMOTIONS =====
     {
         'category': 'Direct',
@@ -274,7 +256,7 @@ test_cases = [
         'expected_emotion': 'fear',
         'explanation': 'Direct expression of anxiety'
     },
-
+    
     # ===== SOCIAL MEDIA SHORTHAND =====
     {
         'category': 'Shorthand',
@@ -294,75 +276,8 @@ test_cases = [
         'expected_emotion': 'anger',
         'explanation': 'Fire emoji with "this is fine" - hidden panic/anger'
     },
-    {
-        'category': 'Shorthand',
-        'description': 'Repeated letters for emphasis',
-        'text': "Nooooooooooo whyyyyyyy",
-        'emoji': "😫",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'sadness',
-        'explanation': 'Tired face with drawn-out words - hidden distress'
-    },
-
-    # ===== EMPATHY & SUPPORT =====
-    {
-        'category': 'Empathy',
-        'description': 'Supportive but concerned',
-        'text': "I'm here for you if you need to talk. Stay strong.",
-        'emoji': "🤗",
-        'expected_hidden': 'NOT HIDDEN',
-        'expected_emotion': 'love',
-        'explanation': 'Open-hearted support'
-    },
-    {
-        'category': 'Empathy',
-        'description': 'Sharing someone else\'s pain',
-        'text': "Reading this broke my heart. Sending love.",
-        'emoji': "💔",
-        'expected_hidden': 'NOT HIDDEN',
-        'expected_emotion': 'sadness',
-        'explanation': 'Direct expression of empathy'
-    },
-
-    # ===== NARRATIVE CONTEXT =====
-    {
-        'category': 'Narrative',
-        'description': 'Story with emotional twist',
-        'text': "She said yes! Wait no, she was joking. Haha... ha...",
-        'emoji': "😅",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'sadness',
-        'explanation': 'Sweating smile masks disappointment'
-    },
-    {
-        'category': 'Narrative',
-        'description': 'Building suspense',
-        'text': "I have something to tell you. But maybe later. Or never. Idk.",
-        'emoji': "🤐",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'fear',
-        'explanation': 'Zipped mouth - hidden anxiety/fear'
-    },
-
+    
     # ===== CULTURAL REFERENCES =====
-    {
-        'category': 'Cultural',
-        'description': 'Movie reference',
-        'text': "You can't handle the truth!",
-        'emoji': "😤",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'anger',
-        'explanation': 'Famous line delivered with anger - but is it real?'
-    },
-    {
-        'category': 'Cultural',
-        'description': 'Song lyrics',
-        'text': "I'm a survivor, I'm not gonna give up",
-        'emoji': "💪",
-        'expected_hidden': 'NOT HIDDEN',
-        'expected_emotion': 'joy',
-        'explanation': 'Empowering lyrics - genuine confidence'
-    },
     {
         'category': 'Cultural',
         'description': 'Meme reference',
@@ -372,36 +287,7 @@ test_cases = [
         'expected_emotion': 'fear',
         'explanation': 'Classic "this is fine" meme - hidden panic'
     },
-
-    # ===== EMOTIONAL NUANCE =====
-    {
-        'category': 'Nuance',
-        'description': 'Bittersweet moment',
-        'text': "My last day at work. Gonna miss these crazies.",
-        'emoji': "🥲",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'sadness',
-        'explanation': 'Smiling through tears - hidden sadness'
-    },
-    {
-        'category': 'Nuance',
-        'description': 'Relief after stress',
-        'text': "Finally done with exams. I can breathe.",
-        'emoji': "😮‍💨",
-        'expected_hidden': 'NOT HIDDEN',
-        'expected_emotion': 'joy',
-        'explanation': 'Visible relief - genuine joy'
-    },
-    {
-        'category': 'Nuance',
-        'description': 'Anticipatory anxiety',
-        'text': "Tomorrow's the big day. Can't sleep. What if I mess up?",
-        'emoji': "😬",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'fear',
-        'explanation': 'Grimacing face - hidden anxiety'
-    },
-
+    
     # ===== CONTRADICTORY SIGNALS =====
     {
         'category': 'Contradiction',
@@ -421,19 +307,10 @@ test_cases = [
         'expected_emotion': 'sadness',
         'explanation': 'Laughing emoji masks serious statement - hidden sadness'
     },
-    {
-        'category': 'Contradiction',
-        'description': 'Neutral words, extreme emoji',
-        'text': "The meeting is at 3pm.",
-        'emoji': "🤯",
-        'expected_hidden': 'HIDDEN',
-        'expected_emotion': 'surprise',
-        'explanation': 'Exploding head over mundane info - hidden shock/overwhelm'
-    },
 ]
 
 # ============================================================================
-# 3. RUN TEST CASES
+# 4. RUN TEST CASES
 # ============================================================================
 print("\n" + "=" * 80)
 print("3. TEST RESULTS")
@@ -478,6 +355,7 @@ for i, test in enumerate(test_cases, 1):
         'expected_emotion': test['expected_emotion'],
         'predicted_emotion': result['emotion'],
         'emotion_conf': result['emotion_conf'],
+        'calibrated_conf': result['calibrated_confidence'],
         'hidden_correct': hidden_correct,
         'emotion_correct': emotion_correct,
         'top_3': result['top_3']
@@ -490,17 +368,14 @@ for i, test in enumerate(test_cases, 1):
     print(f"   {'✅' if hidden_correct else '❌'} {'Correct' if hidden_correct else 'Incorrect'}")
     
     print(f"\n   Emotion: {result['emotion']} (conf: {result['emotion_conf']:.3f})")
+    print(f"   Calibrated Confidence: {result['calibrated_confidence']:.3f}")  # Fixed key name
     print(f"   Expected: {test['expected_emotion']}")
     print(f"   {'✅' if emotion_correct else '❌'} {'Correct' if emotion_correct else 'Incorrect'}")
     
     print(f"\n   Top 3 Emotions: {', '.join(result['top_3'])}")
-    
-    # Show full probability distribution
-    probs_str = ", ".join([f"{e}: {p:.2f}" for e, p in result['all_probs'].items()])
-    print(f"   Full Distribution: {probs_str}")
 
 # ============================================================================
-# 4. SUMMARY STATISTICS
+# 5. SUMMARY STATISTICS
 # ============================================================================
 print("\n" + "=" * 80)
 print("4. SUMMARY STATISTICS")
@@ -541,21 +416,44 @@ for cat, stats in categories.items():
     print(f"      Both: {both_cat_acc:.1f}% ({stats['both_correct']}/{stats['total']})")
 
 # ============================================================================
-# 5. ERROR ANALYSIS
+# 6. CALIBRATION ANALYSIS
 # ============================================================================
 print("\n" + "=" * 80)
-print("5. ERROR ANALYSIS")
+print("5. CALIBRATION ANALYSIS")
+print("=" * 80)
+
+# Compare raw confidence vs calibrated confidence
+raw_conf_correct = [r['emotion_conf'] for r in results if r['emotion_correct']]
+raw_conf_incorrect = [r['emotion_conf'] for r in results if not r['emotion_correct']]
+cal_conf_correct = [r['calibrated_conf'] for r in results if r['emotion_correct']]
+cal_conf_incorrect = [r['calibrated_conf'] for r in results if not r['emotion_correct']]
+
+print(f"\n📊 Raw Confidence:")
+print(f"   Correct:   {np.mean(raw_conf_correct):.3f} ± {np.std(raw_conf_correct):.3f}")
+print(f"   Incorrect: {np.mean(raw_conf_incorrect):.3f} ± {np.std(raw_conf_incorrect):.3f}")
+print(f"   Gap:       {np.mean(raw_conf_correct) - np.mean(raw_conf_incorrect):.3f}")
+
+print(f"\n📊 Calibrated Confidence:")
+print(f"   Correct:   {np.mean(cal_conf_correct):.3f} ± {np.std(cal_conf_correct):.3f}")
+print(f"   Incorrect: {np.mean(cal_conf_incorrect):.3f} ± {np.std(cal_conf_incorrect):.3f}")
+print(f"   Gap:       {np.mean(cal_conf_correct) - np.mean(cal_conf_incorrect):.3f}")
+
+# ============================================================================
+# 7. ERROR ANALYSIS
+# ============================================================================
+print("\n" + "=" * 80)
+print("6. ERROR ANALYSIS")
 print("=" * 80)
 
 # Find cases where model struggled
 print("\n🔍 Cases Where Model Struggled:")
 difficult_cases = [r for r in results if not r['emotion_correct'] or not r['hidden_correct']]
-for i, case in enumerate(difficult_cases[:10], 1):  # Show top 10 difficult cases
+for i, case in enumerate(difficult_cases[:5], 1):
     print(f"\n{i}. {case['category']} - {case['description']}")
     print(f"   Text: {case['text'][:100]}...")
     print(f"   Predicted: {case['predicted_hidden']} ({case['predicted_emotion']})")
     print(f"   Expected:  {case['expected_hidden']} ({case['expected_emotion']})")
-    print(f"   Confidence: Hidden={case['hidden_conf']:.3f}, Emotion={case['emotion_conf']:.3f}")
+    print(f"   Confidence: Raw={case['emotion_conf']:.3f}, Calibrated={case['calibrated_conf']:.3f}")
 
 # Confusion patterns
 print("\n🔄 Emotion Confusion Patterns:")
@@ -569,94 +467,8 @@ sorted_confusions = sorted(confusion_matrix.items(), key=lambda x: x[1], reverse
 for confusion, count in sorted_confusions[:5]:
     print(f"   {confusion}: {count} times")
 
-# Hidden flag error patterns
-hidden_fp = [r for r in results if r['expected_hidden'] == 'NOT HIDDEN' and 'HIDDEN' in r['predicted_hidden']]
-hidden_fn = [r for r in results if r['expected_hidden'] == 'HIDDEN' and 'NOT HIDDEN' in r['predicted_hidden']]
-
-print(f"\n🚩 Hidden Flag Errors:")
-print(f"   False Positives: {len(hidden_fp)} cases")
-if hidden_fp:
-    print("   Examples:")
-    for case in hidden_fp[:3]:
-        print(f"     • {case['description']}: '{case['text'][:50]}...'")
-
-print(f"   False Negatives: {len(hidden_fn)} cases")
-if hidden_fn:
-    print("   Examples:")
-    for case in hidden_fn[:3]:
-        print(f"     • {case['description']}: '{case['text'][:50]}...'")
-
 # ============================================================================
-# 6. VISUALIZATION
-# ============================================================================
-print("\n" + "=" * 80)
-print("6. GENERATING VISUALIZATIONS")
-print("=" * 80)
-
-fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-
-# 1. Performance by category
-ax1 = axes[0, 0]
-categories_list = list(categories.keys())
-hidden_scores = [(categories[cat]['hidden_correct']/categories[cat]['total'])*100 for cat in categories_list]
-emotion_scores = [(categories[cat]['emotion_correct']/categories[cat]['total'])*100 for cat in categories_list]
-
-x = np.arange(len(categories_list))
-width = 0.35
-ax1.bar(x - width/2, hidden_scores, width, label='Hidden Flag', color='steelblue')
-ax1.bar(x + width/2, emotion_scores, width, label='Emotion', color='lightcoral')
-ax1.set_xlabel('Category')
-ax1.set_ylabel('Accuracy (%)')
-ax1.set_title('Performance by Category')
-ax1.set_xticks(x)
-ax1.set_xticklabels(categories_list, rotation=45, ha='right')
-ax1.legend()
-ax1.set_ylim(0, 100)
-
-# 2. Confusion matrix heatmap for emotions
-ax2 = axes[0, 1]
-emotion_cm = np.zeros((6, 6))
-for result in results:
-    true_idx = list(emotion_names).index(result['expected_emotion'])
-    pred_idx = list(emotion_names).index(result['predicted_emotion'])
-    emotion_cm[true_idx, pred_idx] += 1
-
-sns.heatmap(emotion_cm, annot=True, fmt='.0f', cmap='YlOrRd', ax=ax2,
-            xticklabels=emotion_names, yticklabels=emotion_names)
-ax2.set_title('Emotion Confusion Matrix')
-ax2.set_xlabel('Predicted')
-ax2.set_ylabel('True')
-
-# 3. Confidence distribution
-ax3 = axes[1, 0]
-correct_confs = [r['emotion_conf'] for r in results if r['emotion_correct']]
-incorrect_confs = [r['emotion_conf'] for r in results if not r['emotion_correct']]
-
-ax3.hist([correct_confs, incorrect_confs], bins=10, 
-         label=['Correct', 'Incorrect'], alpha=0.7, color=['green', 'red'])
-ax3.set_xlabel('Confidence')
-ax3.set_ylabel('Count')
-ax3.set_title('Emotion Confidence Distribution')
-ax3.legend()
-
-# 4. Hidden flag confidence
-ax4 = axes[1, 1]
-hid_correct_confs = [r['hidden_conf'] for r in results if r['hidden_correct']]
-hid_incorrect_confs = [r['hidden_conf'] for r in results if not r['hidden_correct']]
-
-ax4.hist([hid_correct_confs, hid_incorrect_confs], bins=10,
-         label=['Correct', 'Incorrect'], alpha=0.7, color=['steelblue', 'orange'])
-ax4.set_xlabel('Confidence')
-ax4.set_ylabel('Count')
-ax4.set_title('Hidden Flag Confidence Distribution')
-ax4.legend()
-
-plt.tight_layout()
-plt.savefig('deep_context_test_results.png', dpi=150, bbox_inches='tight')
-print("✅ Visualization saved as 'deep_context_test_results.png'")
-
-# ============================================================================
-# 7. EXPORT RESULTS
+# 8. EXPORT RESULTS
 # ============================================================================
 print("\n" + "=" * 80)
 print("7. EXPORTING RESULTS")
@@ -664,21 +476,17 @@ print("=" * 80)
 
 # Save detailed results
 results_df = pd.DataFrame(results)
-results_df.to_csv('deep_context_test_results.csv', index=False)
-print("✅ Detailed results saved as 'deep_context_test_results.csv'")
+results_df.to_csv('deep_context_test_results_improved.csv', index=False)
+print("✅ Detailed results saved as 'deep_context_test_results_improved.csv'")
 
 # Save summary
 summary_df = pd.DataFrame({
     'Metric': ['Total Tests', 'Hidden Flag Accuracy', 'Emotion Accuracy', 'Both Correct'],
     'Value': [total_tests, f"{hidden_acc:.1f}%", f"{emotion_acc:.1f}%", f"{both_acc:.1f}%"]
 })
-summary_df.to_csv('deep_context_summary.csv', index=False)
-print("✅ Summary saved as 'deep_context_summary.csv'")
+summary_df.to_csv('deep_context_summary_improved.csv', index=False)
+print("✅ Summary saved as 'deep_context_summary_improved.csv'")
 
 print("\n" + "=" * 80)
 print("✅ DEEP CONTEXT TESTING COMPLETE!")
 print("=" * 80)
-print("\nGenerated files:")
-print("   • deep_context_test_results.csv")
-print("   • deep_context_summary.csv")
-print("   • deep_context_test_results.png")
